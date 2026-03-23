@@ -3,8 +3,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-// ĐÃ XÓA IMPORT GOOGLE ML KIT BỊ MÙ NGÓN TAY
-
 import '../../../core/constants/app_constants.dart';
 import '../../../core/ml/pose_service.dart';
 import '../../../core/ml/tflite_service.dart';
@@ -21,6 +19,7 @@ class InferenceState {
   final String? errorMessage;
   final int currentFrame;
   final int totalFrames;
+  final List<double>? landmarks; // NEW
 
   const InferenceState({
     this.status = InferenceStatus.loading,
@@ -29,6 +28,7 @@ class InferenceState {
     this.errorMessage,
     this.currentFrame = 0,
     this.totalFrames = 40,
+    this.landmarks,
   });
 
   InferenceState copyWith({
@@ -38,6 +38,7 @@ class InferenceState {
     String? errorMessage,
     int? currentFrame,
     int? totalFrames,
+    List<double>? landmarks,
   }) {
     return InferenceState(
       status: status ?? this.status,
@@ -46,6 +47,7 @@ class InferenceState {
       errorMessage: errorMessage ?? this.errorMessage,
       currentFrame: currentFrame ?? this.currentFrame,
       totalFrames: totalFrames ?? this.totalFrames,
+      landmarks: landmarks ?? this.landmarks,
     );
   }
 
@@ -58,7 +60,7 @@ class InferenceState {
       case InferenceStatus.ready:
         return '✅ Đứng vào khung hình nhé!';
       case InferenceStatus.detecting:
-        return '🔄 Đang quét động tác: $currentFrame/$totalFrames';
+        return '🔄 Đang ghi hình động tác... ($currentFrame)';
       case InferenceStatus.result:
         final conf = confidence != null
             ? ' (${(confidence! * 100).toStringAsFixed(1)}%)'
@@ -74,10 +76,15 @@ class InferenceNotifier extends Notifier<InferenceState> {
 
   final List<List<double>> _frameBuffer = [];
   bool _isProcessing = false;
+  bool _hasPredictedCurrentGesture = false; // NEW
+  int _landmarkSkip = 0;
+  static const int _landmarkStride = 2; // chỉ đẩy lên UI mỗi 2 frame
 
-  int _skipCount = 0;
-
-  static const int _minFramesForPredict = 1;
+  // --- CÁC THÔNG SỐ CỦA CƠ CHẾ TRIGGER-ON-DROP ---
+  int _nullPatienceCount = 0;
+  static const int _maxNullAllowed = 2; // Chờ ~0.3s sau khi buông tay
+  static const int _minFramesForValidGesture =
+      2; // Phải múa ít nhất 8 frame mới tính là 1 từ
 
   @override
   InferenceState build() {
@@ -94,93 +101,118 @@ class InferenceNotifier extends Notifier<InferenceState> {
     debugPrint('✅ Model sẵn sàng');
   }
 
-  // 🔴 LƯU Ý: Chuyển InputImageRotation thành kiểu int rotation
-  Future<void> processCameraFrame(CameraImage image, int rotation) async {
+  Future<void> processCameraFrame(
+    CameraImage image,
+    int rotation,
+    bool isFrontCamera,
+  ) async {
     if (_isProcessing) return;
     _isProcessing = true;
 
     try {
-      // 1. GOM MẢNG BYTE TỪ CAMERA (Định dạng NV21)
-      final WriteBuffer allBytes = WriteBuffer();
-      for (final Plane plane in image.planes) {
-        allBytes.putUint8List(plane.bytes);
-      }
-      final bytes = allBytes.done().buffer.asUint8List();
+      late Uint8List bytes;
 
-      // 2. GỌI KÊNH NATIVE KOTLIN CHẠY MEDIAPIPE
-      final features = await _poseService.extractFeatures(
+      if (image.format.group == ImageFormatGroup.bgra8888) {
+        bytes = image.planes[0].bytes;
+      } else {
+        bytes = _convertYUV420ToNV21(image);
+      }
+
+      final resultData = await _poseService.extractFeatures(
         bytes,
         image.width,
         image.height,
         rotation,
+        isFrontCamera,
       );
 
-      if (features == null) {
-        _frameBuffer.clear();
-        state = state.copyWith(
-          status: InferenceStatus.ready,
-          label: '👻 Không thấy bàn tay nào',
-          currentFrame: 0,
-        );
-      } else {
-        _frameBuffer.add(features);
+      if (resultData == null) {
+        _nullPatienceCount++;
 
+        if (_nullPatienceCount > _maxNullAllowed) {
+          if (_frameBuffer.length >= _minFramesForValidGesture) {
+            final snapshot = List<List<double>>.from(_frameBuffer);
+            final lastFrame = snapshot.last;
+            while (snapshot.length < AppConstants.framesPerSequence) {
+              snapshot.add(lastFrame);
+            }
+
+            final resultData = _tfliteService.predict(snapshot);
+            final labelStr = resultData['label'] as String?;
+            final confidenceVal = resultData['confidence'] as double?;
+
+            debugPrint(
+              "⚡ AI CHỐT KẾT QUẢ: [$labelStr] - Tự tin: ${(confidenceVal ?? 0) * 100}%",
+            );
+
+            if (labelStr != null &&
+                confidenceVal != null &&
+                confidenceVal >= 0.7) {
+              state = state.copyWith(
+                label: labelStr,
+                confidence: confidenceVal,
+                status: InferenceStatus.result,
+                currentFrame: 0,
+                landmarks: [], // clear drawing
+              );
+            }
+          } else {
+            if (state.status == InferenceStatus.detecting) {
+              state = state.copyWith(
+                status: InferenceStatus.ready,
+                currentFrame: 0,
+                landmarks: [], // clear drawing
+              );
+            }
+          }
+
+          _frameBuffer.clear();
+          _hasPredictedCurrentGesture = false;
+        }
+      } else {
+        final features = resultData['features']!;
+        final rawLandmarks = resultData['landmarks']!;
+
+        _nullPatienceCount = 0;
+        _frameBuffer.add(features);
         if (_frameBuffer.length > AppConstants.framesPerSequence) {
           _frameBuffer.removeAt(0);
         }
 
-        // 3. Nếu mới có dưới _minFramesForPredict frame
-        if (_frameBuffer.length < _minFramesForPredict) {
-          state = state.copyWith(
-            status: InferenceStatus.detecting,
-            currentFrame: _frameBuffer.length,
-          );
-        }
-        // 4. ĐÃ ĐỦ FRAME TỐI THIỂU -> BẮT ĐẦU SUY LUẬN NHANH HƠN
-        else {
-          _skipCount++;
+        final bool pushLandmarks =
+            (_landmarkSkip++ % _landmarkStride == 0) &&
+            !listEquals(state.landmarks, rawLandmarks);
 
-          // Chạy AI mỗi 2 frame (trước là 3) để phản hồi nhanh hơn
-          if (_skipCount % 2 != 0) {
-            if (state.status != InferenceStatus.result) {
-              state = state.copyWith(currentFrame: _frameBuffer.length);
-            }
-            _isProcessing = false;
-            return;
-          }
-
-          final snapshot = List<List<double>>.from(
-            _frameBuffer.map((f) => List<double>.from(f)),
-          );
-
-          // Bổ sung frame cuối cho đủ bộ 10 frame
-          final lastFrame = snapshot.last;
-          while (snapshot.length < AppConstants.framesPerSequence) {
-            snapshot.add(lastFrame);
-          }
-
+        if (!_hasPredictedCurrentGesture &&
+            _frameBuffer.length >= AppConstants.framesPerSequence) {
+          final snapshot = List<List<double>>.from(_frameBuffer);
           final resultData = _tfliteService.predict(snapshot);
-
           final labelStr = resultData['label'] as String?;
           final confidenceVal = resultData['confidence'] as double?;
-
-          debugPrint(
-            "⚡ AI đang nghĩ: [$labelStr] - Tự tin: ${(confidenceVal ?? 0) * 100}% (Đang có ${_frameBuffer.length} frames)",
-          );
-
-          if (labelStr != null) {
+          if (labelStr != null &&
+              confidenceVal != null &&
+              confidenceVal >= 0.7) {
             state = state.copyWith(
-              label: labelStr, // Hiện thẳng lên màn hình dù là "Không rõ"
+              label: labelStr,
               confidence: confidenceVal,
               status: InferenceStatus.result,
-              currentFrame: _frameBuffer.length,
+              currentFrame: 0,
+              landmarks: pushLandmarks ? rawLandmarks : state.landmarks,
             );
+            _hasPredictedCurrentGesture = true;
           } else {
             state = state.copyWith(
               status: InferenceStatus.detecting,
-              currentFrame: 40,
+              currentFrame: _frameBuffer.length,
+              landmarks: pushLandmarks ? rawLandmarks : state.landmarks,
             );
           }
+        } else {
+          state = state.copyWith(
+            status: InferenceStatus.detecting,
+            currentFrame: _frameBuffer.length,
+            landmarks: pushLandmarks ? rawLandmarks : state.landmarks,
+          );
         }
       }
     } catch (e) {
@@ -188,6 +220,37 @@ class InferenceNotifier extends Notifier<InferenceState> {
     } finally {
       _isProcessing = false;
     }
+  }
+
+  Uint8List _convertYUV420ToNV21(CameraImage image) {
+    final width = image.width;
+    final height = image.height;
+    final yPlane = image.planes[0];
+    final uPlane = image.planes[1];
+    final vPlane = image.planes[2];
+
+    final yRowStride = yPlane.bytesPerRow;
+    final uvRowStride = uPlane.bytesPerRow;
+    final uvPixelStride = uPlane.bytesPerPixel ?? 1;
+
+    final nv21 = Uint8List(width * height * 3 ~/ 2);
+    int idY = 0;
+    int idUV = width * height;
+
+    for (int y = 0; y < height; y++) {
+      nv21.setRange(idY, idY + width, yPlane.bytes, y * yRowStride);
+      idY += width;
+    }
+
+    for (int y = 0; y < height ~/ 2; y++) {
+      final uvOffset = y * uvRowStride;
+      for (int x = 0; x < width ~/ 2; x++) {
+        final index = uvOffset + (x * uvPixelStride);
+        nv21[idUV++] = vPlane.bytes[index];
+        nv21[idUV++] = uPlane.bytes[index];
+      }
+    }
+    return nv21;
   }
 }
 

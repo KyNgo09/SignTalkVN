@@ -14,6 +14,7 @@ class TFLiteService {
   bool get isLoaded => _isLoaded;
   String? get loadError => _loadError;
 
+  // ✅ Thêm loadModel để inference_provider gọi được
   Future<bool> loadModel(String modelPath) async {
     await initialize();
     return _isLoaded;
@@ -37,10 +38,16 @@ class TFLiteService {
       _isLoaded = true;
       _loadError = null;
       log("✅ TFLite model loaded successfully");
+      log("   Input tensors: ${_interpreter!.getInputTensors()}");
+      log("   Output tensors: ${_interpreter!.getOutputTensors()}");
     } catch (e) {
       _isLoaded = false;
       _loadError = e.toString();
       debugPrint("❌ Error loading TFLite Model: $e");
+      if (e.toString().contains("failed precondition")) {
+        debugPrint("👉 LƯU Ý: Lỗi 'failed precondition' thường do model chứa Select TF Ops (ví dụ Flex ops như RNN/LSTM) không được hỗ trợ sẵn trên nền tảng hiện tại (đặc biệt là Windows/Desktop).");
+        debugPrint("👉 Cách xử lý: Hãy chạy trên device/emulator Android, VÀ đảm bảo TensorFlow Lite version đang dùng hỗ trợ op này, HOẶC convert lại model TFLite chỉ dùng TFLITE_BUILTINS.");
+      }
     }
   }
 
@@ -60,40 +67,25 @@ class TFLiteService {
     }
   }
 
+  // ✅ predict trả về Map để inference_provider dùng label + confidence
   Map<String, dynamic> predict(List<List<double>> inputSequence) {
     if (_interpreter == null || _labels.isEmpty) {
       return {'label': 'Đang tải AI...', 'confidence': 0.0};
     }
-
-    // Kiểm tra an toàn độ dài sequence
     if (inputSequence.length != AppConstants.framesPerSequence) {
       return {'label': 'Chờ đủ frame...', 'confidence': 0.0};
     }
 
+    var inputTensor = [inputSequence];
+    var outputTensor = List.filled(
+      1 * _labels.length,
+      0.0,
+    ).reshapeTo([1, _labels.length]); // ✅ Đổi tên tránh xung đột
+
     try {
-      // 1. TẠO TENSOR ĐẦU VÀO CHUẨN (Ép kiểu nghiêm ngặt để TFLite C++ đọc được)
-      var inputTensor = List.generate(
-        1,
-        (i) => List.generate(
-          AppConstants.framesPerSequence, // 40
-          (j) => List.generate(
-            AppConstants.featuresPerFrame, // 96
-            (k) => inputSequence[j][k],
-          ),
-        ),
-      );
-
-      // 2. TẠO TENSOR ĐẦU RA CHUẨN
-      var outputTensor = List.generate(
-        1,
-        (i) => List.filled(_labels.length, 0.0),
-      );
-
-      // 3. CHẠY SUY LUẬN
       _interpreter!.run(inputTensor, outputTensor);
 
-      // 4. TRÍCH XUẤT KẾT QUẢ
-      List<double> probabilities = outputTensor[0];
+      List<double> probabilities = (outputTensor[0] as List).cast<double>();
       double maxProb = 0.0;
       int maxIndex = -1;
 
@@ -118,6 +110,29 @@ class TFLiteService {
     }
   }
 
+  Future<List<dynamic>?> runInference(List<dynamic> input) async {
+    if (!_isLoaded || _interpreter == null) {
+      log('⚠️ Model chưa được load');
+      return null;
+    }
+
+    try {
+      final outputShape = _interpreter!.getOutputTensor(0).shape;
+      // ✅ Bỏ outputType vì không dùng
+
+      final output = List.filled(
+        outputShape.reduce((a, b) => a * b),
+        0.0,
+      ).reshapeTo(outputShape); // ✅ Đổi tên tránh xung đột
+
+      _interpreter!.run(input, output);
+      return output;
+    } catch (e) {
+      log('❌ Inference error: $e');
+      return null;
+    }
+  }
+
   void dispose() {
     _interpreter?.close();
     _interpreter = null;
@@ -125,3 +140,16 @@ class TFLiteService {
   }
 }
 
+// ✅ Đổi tên extension thành TFLiteListReshape và method thành reshapeTo
+// để tránh xung đột với extension ListShape của tflite_flutter
+extension TFLiteListReshape on List {
+  List reshapeTo(List<int> shape) {
+    if (shape.length == 1) return this;
+    int chunkSize = shape.sublist(1).reduce((a, b) => a * b);
+    List result = [];
+    for (int i = 0; i < length; i += chunkSize) {
+      result.add(sublist(i, i + chunkSize).reshapeTo(shape.sublist(1)));
+    }
+    return result;
+  }
+}

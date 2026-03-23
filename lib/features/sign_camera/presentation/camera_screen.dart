@@ -1,9 +1,12 @@
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:path/path.dart' as p;
 
 import '../providers/camera_provider.dart';
 import '../providers/inference_provider.dart';
+import '../providers/video_upload_provider.dart';
+import '../widgets/landmark_painter.dart';
 
 class CameraScreen extends ConsumerWidget {
   const CameraScreen({super.key});
@@ -39,6 +42,11 @@ class CameraScreen extends ConsumerWidget {
                           fit: StackFit.expand,
                           children: [
                             CameraPreview(controller),
+                            CustomPaint(
+                              painter: LandmarkPainter(
+                                inferenceState.landmarks ?? const [],
+                              ),
+                            ),
                             _CornersOverlay(),
                           ],
                         ),
@@ -50,7 +58,7 @@ class CameraScreen extends ConsumerWidget {
                       child: _ResultCard(inferenceState: inferenceState),
                     ),
                     const SizedBox(height: 12),
-                    const _BottomNav(),
+                    _BottomNav(),
                     const SizedBox(height: 10),
                   ],
                 ),
@@ -229,13 +237,51 @@ class _CornerPainter extends CustomPainter {
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
 
+// Thêm map mã nhãn -> tiếng Việt (có dấu)
+const Map<String, String> _vnLabelMap = {
+  'AN': 'Ăn',
+  'BAC_SI': 'Bác sĩ',
+  'BAN': 'Bạn',
+  'BAO_NHIEU': 'Bao nhiêu',
+  'BUON': 'Buồn',
+  'CAM_ON': 'Cảm ơn',
+  'CHA': 'Cha',
+  'DAU': 'Đau',
+  'DI': 'Đi',
+  'GHET': 'Ghét',
+  'GI': 'Gì',
+  'GIAO_VIEN': 'Giáo viên',
+  'HEN_GAP_LAI': 'Hẹn gặp lại',
+  'HIEU': 'Hiểu',
+  'HOC': 'Học',
+  'KHI_NAO': 'Khi nào',
+  'KHOE': 'Khỏe',
+  'LAM': 'Làm',
+  'ME': 'Mẹ',
+  'MET': 'Mệt',
+  'NGU': 'Ngủ',
+  'O_DAU': 'Ở đâu',
+  'TAM_BIET': 'Tạm biệt',
+  'THICH': 'Thích',
+  'TOI': 'Tôi',
+  'UONG': 'Uống',
+  'VE': 'Về',
+  'VUI': 'Vui',
+  'XIN_CHAO': 'Xin chào',
+  'XIN_LOI': 'Xin lỗi',
+  'YEU': 'Yêu',
+};
+
 class _ResultCard extends StatelessWidget {
   final InferenceState inferenceState;
   const _ResultCard({required this.inferenceState});
 
   @override
   Widget build(BuildContext context) {
-    final label = inferenceState.label ?? 'Đang quét...';
+    final rawLabel = inferenceState.label;
+    final displayLabel = rawLabel != null
+        ? (_vnLabelMap[rawLabel] ?? rawLabel)
+        : 'Đang quét...';
     final conf = inferenceState.confidence != null
         ? '${(inferenceState.confidence! * 100).toStringAsFixed(0)}%'
         : '--';
@@ -273,7 +319,7 @@ class _ResultCard extends StatelessWidget {
             children: [
               Expanded(
                 child: Text(
-                  label.toUpperCase(),
+                  displayLabel.toUpperCase(),
                   style: const TextStyle(
                     color: Colors.white,
                     fontSize: 26,
@@ -333,11 +379,11 @@ class _ResultCard extends StatelessWidget {
   }
 }
 
-class _BottomNav extends StatelessWidget {
+class _BottomNav extends ConsumerWidget {
   const _BottomNav();
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 18),
       child: Container(
@@ -355,16 +401,31 @@ class _BottomNav extends StatelessWidget {
           ],
         ),
         child: Row(
-          children: const [
+          children: [
             Expanded(
               child: _NavItem(
                 icon: Icons.video_library_outlined,
                 label: 'Tải video',
                 isActive: false,
-                onTap: _noop,
+                onTap: () async {
+                  final picked = await ref
+                      .read(videoUploadProvider.notifier)
+                      .pickFromGallery();
+                  if (!context.mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        picked == null
+                            ? 'Bạn chưa chọn video.'
+                            : 'Đã chọn: ${p.basename(picked.path)} '
+                                  '(${(picked.sizeBytes / (1024 * 1024)).toStringAsFixed(1)} MB)',
+                      ),
+                    ),
+                  );
+                },
               ),
             ),
-            Expanded(
+            const Expanded(
               child: _NavItem(
                 icon: Icons.photo_camera,
                 label: 'Camera',
@@ -372,7 +433,7 @@ class _BottomNav extends StatelessWidget {
                 onTap: _noop,
               ),
             ),
-            Expanded(
+            const Expanded(
               child: _NavItem(
                 icon: Icons.settings,
                 label: 'Settings',

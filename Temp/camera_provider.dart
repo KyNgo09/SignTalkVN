@@ -47,17 +47,20 @@ final cameraProvider = FutureProvider.autoDispose<CameraController>((
     ResolutionPreset.medium,
     enableAudio: false,
     fps: 30,
+    // BẮT BUỘC: Ép định dạng ảnh xuất ra là NV21 (Android) hoặc BGRA (iOS)
     imageFormatGroup: Platform.isIOS
         ? ImageFormatGroup.bgra8888
-        : ImageFormatGroup.yuv420,  );
+        : ImageFormatGroup.nv21,
+  );
 
   await controller.initialize();
 
   // 5. Bơm luồng hình ảnh sang cho InferenceProvider (AI)
-  final isFrontCamera = lensDirection == CameraLensDirection.front;
   controller.startImageStream((CameraImage image) {
+   
     final rotation = selectedCamera.sensorOrientation;
-    ref.read(inferenceProvider.notifier).processCameraFrame(image, rotation, isFrontCamera);
+
+    ref.read(inferenceProvider.notifier).processCameraFrame(image, rotation);
   });
 
   // 6. Tự động dọn dẹp bộ nhớ khi tắt / chuyển camera

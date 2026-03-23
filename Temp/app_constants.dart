@@ -9,5 +9,5 @@ class AppConstants {
 
   // Ngưỡng tự tin (Confidence Threshold)
   static const double confidenceThreshold =
-      0.8; // Chỉ nhận chữ nếu AI chắc chắn > 70%
+      0.7; // Chỉ nhận chữ nếu AI chắc chắn > 70%
 }

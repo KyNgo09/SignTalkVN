@@ -1,30 +1,27 @@
 import 'package:flutter/services.dart';
 
 class PoseService {
+  // Bắt tay với lõi Kotlin thông qua kênh này
   static const MethodChannel _channel = MethodChannel('signtalk.dev/mediapipe');
 
-  Future<Map<String, List<double>>?> extractFeatures(
+  Future<List<double>?> extractFeatures(
     Uint8List nv21Bytes,
     int width,
     int height,
     int rotation,
-    bool isFrontCamera,
   ) async {
     try {
+      // Đẩy mảng byte sang Kotlin tính toán
       final result = await _channel.invokeMethod('extractFeatures', {
         'bytes': nv21Bytes,
         'width': width,
         'height': height,
         'rotation': rotation,
-        'isFrontCamera': isFrontCamera,
       });
 
       if (result != null) {
-        final map = Map<String, dynamic>.from(result);
-        return {
-          'features': (map['features'] as List).cast<double>(),
-          'landmarks': (map['landmarks'] as List).cast<double>(),
-        };
+        // Kotlin trả về cục 96 số thập phân chuẩn xác y hệt Python
+        return List<double>.from(result);
       }
       return null;
     } catch (e) {

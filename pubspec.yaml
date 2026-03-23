@@ -40,6 +40,8 @@ dependencies:
   tflite_flutter: ^0.12.1
   camera: ^0.10.5+5  # Dùng để mở và lấy frame từ Camera
   permission_handler: ^11.0.1 # Dùng để xin quyền truy cập Camera
+  image_picker: ^1.0.7
+  path: ^1.9.0
   
 dev_dependencies:
   flutter_test:
