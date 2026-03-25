@@ -7,6 +7,8 @@ import '../../../core/constants/app_constants.dart';
 import '../../../core/ml/pose_service.dart';
 import '../../../core/ml/tflite_service.dart';
 
+import 'video_upload_provider.dart';
+
 final tfliteServiceProvider = Provider<TFLiteService>((ref) => TFLiteService());
 final poseServiceProvider = Provider<PoseService>((ref) => PoseService());
 
@@ -106,18 +108,23 @@ class InferenceNotifier extends Notifier<InferenceState> {
     int rotation,
     bool isFrontCamera,
   ) async {
+    final uploadState = ref.read(videoUploadProvider);
+    if (uploadState.picked != null) {
+      return; // Khóa AI Camera khi đang phát video đã upload
+    }
+
     if (_isProcessing) return;
     _isProcessing = true;
 
     try {
       late Uint8List bytes;
-
       if (image.format.group == ImageFormatGroup.bgra8888) {
         bytes = image.planes[0].bytes;
       } else {
         bytes = _convertYUV420ToNV21(image);
       }
 
+      // GỌI NATIVE: trả về Map {features, landmarks}
       final resultData = await _poseService.extractFeatures(
         bytes,
         image.width,
@@ -126,6 +133,7 @@ class InferenceNotifier extends Notifier<InferenceState> {
         isFrontCamera,
       );
 
+      // KỊCH BẢN 1: KHÔNG THẤY TAY
       if (resultData == null) {
         _nullPatienceCount++;
 
@@ -137,14 +145,9 @@ class InferenceNotifier extends Notifier<InferenceState> {
               snapshot.add(lastFrame);
             }
 
-            final resultData = _tfliteService.predict(snapshot);
-            final labelStr = resultData['label'] as String?;
-            final confidenceVal = resultData['confidence'] as double?;
-
-            debugPrint(
-              "⚡ AI CHỐT KẾT QUẢ: [$labelStr] - Tự tin: ${(confidenceVal ?? 0) * 100}%",
-            );
-
+            final infer = _tfliteService.predict(snapshot);
+            final labelStr = infer['label'] as String?;
+            final confidenceVal = infer['confidence'] as double?;
             if (labelStr != null &&
                 confidenceVal != null &&
                 confidenceVal >= 0.7) {
@@ -153,7 +156,7 @@ class InferenceNotifier extends Notifier<InferenceState> {
                 confidence: confidenceVal,
                 status: InferenceStatus.result,
                 currentFrame: 0,
-                landmarks: [], // clear drawing
+                landmarks: const [], // xóa khung xương
               );
             }
           } else {
@@ -161,34 +164,40 @@ class InferenceNotifier extends Notifier<InferenceState> {
               state = state.copyWith(
                 status: InferenceStatus.ready,
                 currentFrame: 0,
-                landmarks: [], // clear drawing
+                landmarks: const [], // xóa khung xương
               );
             }
           }
-
           _frameBuffer.clear();
           _hasPredictedCurrentGesture = false;
+        } else {
+          // khi chưa vượt ngưỡng, vẫn xoá khung xương để tránh vẽ sai
+          state = state.copyWith(landmarks: const []);
         }
-      } else {
-        final features = resultData['features']!;
-        final rawLandmarks = resultData['landmarks']!;
-
+      }
+      // KỊCH BẢN 2: ĐANG THẤY TAY
+      else {
         _nullPatienceCount = 0;
+
+        // Bóc tách Map ra thành 2 mảng
+        final List<double> features = (resultData['features'] as List)
+            .cast<double>();
+        final List<double> rawLandmarks = (resultData['landmarks'] as List)
+            .cast<double>();
+
+        // Đưa features vào bộ nhớ cho AI
         _frameBuffer.add(features);
         if (_frameBuffer.length > AppConstants.framesPerSequence) {
           _frameBuffer.removeAt(0);
         }
 
-        final bool pushLandmarks =
-            (_landmarkSkip++ % _landmarkStride == 0) &&
-            !listEquals(state.landmarks, rawLandmarks);
-
+        // Đẩy landmarks lên UI (và giữ trigger logic)
         if (!_hasPredictedCurrentGesture &&
             _frameBuffer.length >= AppConstants.framesPerSequence) {
           final snapshot = List<List<double>>.from(_frameBuffer);
-          final resultData = _tfliteService.predict(snapshot);
-          final labelStr = resultData['label'] as String?;
-          final confidenceVal = resultData['confidence'] as double?;
+          final infer = _tfliteService.predict(snapshot);
+          final labelStr = infer['label'] as String?;
+          final confidenceVal = infer['confidence'] as double?;
           if (labelStr != null &&
               confidenceVal != null &&
               confidenceVal >= 0.7) {
@@ -197,21 +206,21 @@ class InferenceNotifier extends Notifier<InferenceState> {
               confidence: confidenceVal,
               status: InferenceStatus.result,
               currentFrame: 0,
-              landmarks: pushLandmarks ? rawLandmarks : state.landmarks,
+              landmarks: rawLandmarks, // vẽ khung xương tay
             );
             _hasPredictedCurrentGesture = true;
           } else {
             state = state.copyWith(
               status: InferenceStatus.detecting,
               currentFrame: _frameBuffer.length,
-              landmarks: pushLandmarks ? rawLandmarks : state.landmarks,
+              landmarks: rawLandmarks,
             );
           }
         } else {
           state = state.copyWith(
             status: InferenceStatus.detecting,
             currentFrame: _frameBuffer.length,
-            landmarks: pushLandmarks ? rawLandmarks : state.landmarks,
+            landmarks: rawLandmarks,
           );
         }
       }

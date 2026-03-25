@@ -1,7 +1,9 @@
+import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
+import 'package:video_player/video_player.dart';
 
 import '../providers/camera_provider.dart';
 import '../providers/inference_provider.dart';
@@ -15,6 +17,7 @@ class CameraScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final cameraState = ref.watch(cameraProvider);
     final inferenceState = ref.watch(inferenceProvider);
+    final uploadState = ref.watch(videoUploadProvider); // <- thêm
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -38,24 +41,23 @@ class CameraScreen extends ConsumerWidget {
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 18),
                       child: _CameraGlass(
-                        child: Stack(
-                          fit: StackFit.expand,
-                          children: [
-                            CameraPreview(controller),
-                            CustomPaint(
-                              painter: LandmarkPainter(
-                                inferenceState.landmarks ?? const [],
-                              ),
-                            ),
-                            _CornersOverlay(),
-                          ],
+                        child: _CameraSurface(
+                          controller: controller,
+                          uploadState: uploadState,
+                          landmarks: inferenceState.landmarks ?? const [],
+                          onCloseVideo: () => ref
+                              .read(videoUploadProvider.notifier)
+                              .clearVideo(),
                         ),
                       ),
                     ),
                     const Spacer(),
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 16),
-                      child: _ResultCard(inferenceState: inferenceState),
+                      child: _ResultCard(
+                        inferenceState: inferenceState,
+                        uploadState: uploadState, // <- thêm
+                      ),
                     ),
                     const SizedBox(height: 12),
                     _BottomNav(),
@@ -146,6 +148,124 @@ class _CameraGlass extends StatelessWidget {
         ),
         child: AspectRatio(aspectRatio: 3 / 4, child: child),
       ),
+    );
+  }
+}
+
+class _CameraSurface extends StatefulWidget {
+  final CameraController controller;
+  final VideoUploadState uploadState;
+  final List<double> landmarks;
+  final VoidCallback onCloseVideo;
+  const _CameraSurface({
+    required this.controller,
+    required this.uploadState,
+    required this.landmarks,
+    required this.onCloseVideo,
+  });
+
+  @override
+  State<_CameraSurface> createState() => _CameraSurfaceState();
+}
+
+class _CameraSurfaceState extends State<_CameraSurface> {
+  VideoPlayerController? _videoCtrl;
+  PickedVideo? _currentPicked;
+  Future<void>? _initVideo;
+
+  @override
+  void didUpdateWidget(covariant _CameraSurface oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final picked = widget.uploadState.picked;
+    if (picked != null && picked != _currentPicked) {
+      _setupVideo(picked);
+    } else if (picked == null && _currentPicked != null) {
+      _disposeVideo();
+    }
+  }
+
+  void _setupVideo(PickedVideo picked) {
+    _disposeVideo();
+    _currentPicked = picked;
+    final ctrl = VideoPlayerController.file(File(picked.path));
+    _videoCtrl = ctrl;
+    _initVideo = ctrl.initialize().then((_) {
+      ctrl.setLooping(true);
+      ctrl.play();
+      if (mounted) setState(() {});
+    });
+    setState(() {});
+  }
+
+  void _disposeVideo() {
+    _currentPicked = null;
+    _initVideo = null;
+    _videoCtrl?.dispose();
+    _videoCtrl = null;
+  }
+
+  @override
+  void dispose() {
+    _disposeVideo();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final showingVideo =
+        widget.uploadState.picked != null && _videoCtrl != null;
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        if (!showingVideo)
+          Stack(
+            fit: StackFit.expand,
+            children: [
+              CameraPreview(widget.controller),
+              CustomPaint(painter: LandmarkPainter(widget.landmarks)),
+              _CornersOverlay(),
+            ],
+          )
+        else
+          FutureBuilder(
+            future: _initVideo,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.done &&
+                  _videoCtrl != null) {
+                return FittedBox(
+                  fit: BoxFit.cover,
+                  child: SizedBox(
+                    width: _videoCtrl!.value.size.width,
+                    height: _videoCtrl!.value.size.height,
+                    child: VideoPlayer(_videoCtrl!),
+                  ),
+                );
+              }
+              return const Center(
+                child: CircularProgressIndicator(color: Colors.white),
+              );
+            },
+          ),
+        if (showingVideo)
+          Positioned(
+            top: 10,
+            right: 10,
+            child: InkWell(
+              onTap: widget.onCloseVideo,
+              borderRadius: BorderRadius.circular(18),
+              child: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(color: Colors.white24, width: 1),
+                ),
+                child: const Icon(Icons.close, color: Colors.white, size: 18),
+              ),
+            ),
+          ),
+      ],
     );
   }
 }
@@ -274,17 +394,28 @@ const Map<String, String> _vnLabelMap = {
 
 class _ResultCard extends StatelessWidget {
   final InferenceState inferenceState;
-  const _ResultCard({required this.inferenceState});
+  final VideoUploadState uploadState; // <- thêm
+  const _ResultCard({required this.inferenceState, required this.uploadState});
 
   @override
   Widget build(BuildContext context) {
-    final rawLabel = inferenceState.label;
-    final displayLabel = rawLabel != null
+    final bool fromUpload =
+        uploadState.status == VideoUploadStatus.done &&
+        (uploadState.sentence?.isNotEmpty ?? false);
+
+    final rawLabel = fromUpload ? uploadState.sentence : inferenceState.label;
+    final displayLabel = fromUpload
+        ? uploadState.sentence!
+        : rawLabel != null
         ? (_vnLabelMap[rawLabel] ?? rawLabel)
         : 'Đang quét...';
-    final conf = inferenceState.confidence != null
+
+    final conf = fromUpload
+        ? '95%' // mock confidence cho video upload
+        : inferenceState.confidence != null
         ? '${(inferenceState.confidence! * 100).toStringAsFixed(0)}%'
         : '--';
+
     return Container(
       decoration: BoxDecoration(
         color: const Color(0xFF0F1E26).withOpacity(0.9),
@@ -303,7 +434,9 @@ class _ResultCard extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            inferenceState.status == InferenceStatus.result
+            fromUpload
+                ? 'VIDEO PREDICTION'
+                : inferenceState.status == InferenceStatus.result
                 ? 'DETECTED'
                 : 'SCANNING',
             style: TextStyle(
@@ -326,7 +459,7 @@ class _ResultCard extends StatelessWidget {
                     fontWeight: FontWeight.w800,
                     letterSpacing: 0.5,
                   ),
-                  maxLines: 1,
+                  maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
@@ -364,7 +497,9 @@ class _ResultCard extends StatelessWidget {
               ),
               const SizedBox(width: 6),
               Text(
-                'Vietnamese Sign Language',
+                fromUpload
+                    ? 'Mock prediction from video upload'
+                    : 'Vietnamese Sign Language',
                 style: TextStyle(
                   color: Colors.white.withOpacity(0.75),
                   fontSize: 13,
@@ -408,10 +543,9 @@ class _BottomNav extends ConsumerWidget {
                 label: 'Tải video',
                 isActive: false,
                 onTap: () async {
-                  final picked = await ref
-                      .read(videoUploadProvider.notifier)
-                      .pickFromGallery();
+                  await ref.read(videoUploadProvider.notifier).pickAndProcess();
                   if (!context.mounted) return;
+                  final picked = ref.read(videoUploadProvider).picked;
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(
                       content: Text(

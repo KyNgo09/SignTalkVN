@@ -1,11 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'features/sign_camera/presentation/camera_screen.dart';
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-
-  // Bọc toàn bộ App bằng ProviderScope để Riverpod hoạt động
+  await dotenv.load(fileName: ".env");
   runApp(const ProviderScope(child: SignTalkApp()));
 }
 

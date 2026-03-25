@@ -42,6 +42,9 @@ dependencies:
   permission_handler: ^11.0.1 # Dùng để xin quyền truy cập Camera
   image_picker: ^1.0.7
   path: ^1.9.0
+  google_generative_ai: ^0.4.3
+  flutter_dotenv: ^5.1.0
+  video_player: ^2.9.1
   
 dev_dependencies:
   flutter_test:
@@ -68,6 +71,7 @@ flutter:
   assets:
     - assets/models/signtalk_model.tflite
     - assets/models/labels_map.json
+    - .env
   # To add assets to your application, add an assets section, like this:
 
   # An image asset can refer to one or more resolution-specific "variants", see
