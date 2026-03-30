@@ -7,7 +7,7 @@ import '../../../core/constants/app_constants.dart';
 // import '../../../core/ml/tflite_service.dart';
 import '../providers/inference_provider.dart';
 import '../services/video_picker_service.dart';
-import '../../../core/ml/gemini_service.dart'; 
+import '../../../core/ml/groq_service.dart'; 
 class PickedVideo {
   final String path;
   final int sizeBytes;
@@ -116,7 +116,7 @@ class VideoUploadNotifier extends Notifier<VideoUploadState> {
 
       // 3. Sliding window
       final int windowSize = AppConstants.framesPerSequence; // 40
-      final int stride = 10;
+      final int stride = 5;
       final List<String> rawPredictions = [];
 
       // Padding nếu quá ngắn
@@ -169,10 +169,10 @@ class VideoUploadNotifier extends Notifier<VideoUploadState> {
         debugPrint("🤖 Đang nhờ Gemini biên dịch chuỗi: $finalGlossList ...");
 
         // Đọc Gemini Service từ Provider
-        final geminiService = ref.read(geminiServiceProvider);
+        final groqService = ref.read(groqServiceProvider);
 
         // Gọi API ném chuỗi thô lên Google Server và chờ kết quả
-        final finalSentence = await geminiService.translateGlossToSentence(
+        final finalSentence = await groqService.translateGlossToSentence(
           finalGlossList,
         );
 

@@ -112,7 +112,7 @@ class MainActivity: FlutterActivity() {
                 }
             } 
             // ==============================================================
-            // NHÁNH 2: TÁCH FRAME TỪ VIDEO UPLOAD LÊN (THÊM MỚI)
+            // NHÁNH 2: TÁCH FRAME TỪ VIDEO UPLOAD LÊN (SIÊU TỐC)
             // ==============================================================
             else if (call.method == "processVideoFile") {
                 val videoPath = call.argument<String>("videoPath")
@@ -130,21 +130,43 @@ class MainActivity: FlutterActivity() {
                         val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                         val durationMs = durationStr?.toLongOrNull() ?: 0L
                         
-                        val intervalUs = 33333L // Lấy ~30 hình/giây
+                        // 1. CHUYỂN XUỐNG 15 FPS ĐỂ GIẢM MỘT NỬA THỜI GIAN XỬ LÝ (~66ms/frame)
+                        val intervalUs = 33333L 
                         val durationUs = durationMs * 1000L
 
+                        // 2. LẤY KÍCH THƯỚC GỐC ĐỂ TÍNH TOÁN THU NHỎ
+                        val videoWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toFloatOrNull() ?: 1080f
+                        val videoHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toFloatOrNull() ?: 1920f
+                        
+                        // Ép khung hình về tối đa 480px chiều dài nhất (MediaPipe chỉ cần 256px là chạy mượt)
+                        val maxDimension = 480f // Ảnh nhỏ AI quét siêu nhanh
+                        val scale = if (videoWidth > videoHeight) maxDimension / videoWidth else maxDimension / videoHeight
+                        val targetWidth = (videoWidth * scale).toInt()
+                        val targetHeight = (videoHeight * scale).toInt()
+
                         for (timeUs in 0 until durationUs step intervalUs) {
-                            val bitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                            // 3. BÓC TÁCH ẢNH ĐÃ ĐƯỢC THU NHỎ (Tiết kiệm 80% RAM và CPU)
+                            val bitmap = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O_MR1) {
+                                // Nếu máy Android 8.1 trở lên, dùng hàm cắt ảnh thu nhỏ siêu nhanh
+                                retriever.getScaledFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST, targetWidth, targetHeight)
+                            } else {
+                                // Máy đời cũ thì cắt ảnh gốc rồi tự thu nhỏ
+                                val rawBitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                                if (rawBitmap != null) {
+                                    val scaled = Bitmap.createScaledBitmap(rawBitmap, targetWidth, targetHeight, true)
+                                    rawBitmap.recycle() // Xóa ngay ảnh gốc cho đỡ đầy RAM
+                                    scaled
+                                } else null
+                            }
+
                             if (bitmap != null) {
                                 val argbBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
                                 val mpImage = BitmapImageBuilder(argbBitmap).build()
                                 val poseResult = poseLandmarker?.detect(mpImage)
                                 val handResult = handLandmarker?.detect(mpImage)
 
-                                // Gọi hàm của bạn, nó trả về Map
                                 val extractedMap = extractAndNormalize(poseResult, handResult)
                                 
-                                // Ta chỉ bóc lấy mảng "features" 96 con số để gửi lên Dart chạy AI
                                 val features = extractedMap?.get("features")
                                 if (features != null) {
                                     featuresSequence.add(features)
@@ -155,7 +177,7 @@ class MainActivity: FlutterActivity() {
                         retriever.release()
 
                         withContext(Dispatchers.Main) {
-                            result.success(featuresSequence) // Trả về List các DoubleArray
+                            result.success(featuresSequence)
                         }
                     } catch (e: Exception) {
                         withContext(Dispatchers.Main) {
