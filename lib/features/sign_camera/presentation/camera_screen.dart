@@ -91,13 +91,14 @@ class CameraScreen extends ConsumerWidget {
   }
 }
 
-class _TopBar extends StatelessWidget {
+class _TopBar extends ConsumerWidget {
   final InferenceState inferenceState;
   const _TopBar({required this.inferenceState});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final active = inferenceState.status != InferenceStatus.loadFailed;
+    final mode = ref.watch(cameraModeProvider);
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 18),
       child: Row(
@@ -106,14 +107,10 @@ class _TopBar extends StatelessWidget {
             color: active ? const Color(0xFF22D3EE) : Colors.redAccent,
             label: active ? 'AI ACTIVE' : 'AI OFF',
           ),
-          const SizedBox(width: 12),
-          Text(
-            'FPS: 30  |  LAT: ~12ms',
-            style: TextStyle(
-              color: Colors.white.withOpacity(0.6),
-              fontSize: 12,
-              letterSpacing: 0.4,
-            ),
+          const SizedBox(width: 8),
+          _Badge(
+            color: mode == CameraMode.dictionary ? Colors.amber : Colors.greenAccent,
+            label: mode == CameraMode.dictionary ? 'TỪ ĐIỂN' : 'GIAO TIẾP',
           ),
         ],
       ),
@@ -403,18 +400,32 @@ class _ResultCard extends StatelessWidget {
         uploadState.status == VideoUploadStatus.done &&
         (uploadState.sentence?.isNotEmpty ?? false);
 
-    final rawLabel = fromUpload ? uploadState.sentence : inferenceState.label;
-    final displayLabel = fromUpload
-        ? uploadState.sentence!
-        : rawLabel != null
-        ? (_vnLabelMap[rawLabel] ?? rawLabel)
-        : 'Đang quét...';
+    late String displayLabel;
+    late String titleText;
+    String conf = '--';
 
-    final conf = fromUpload
-        ? '95%' // mock confidence cho video upload
-        : inferenceState.confidence != null
-        ? '${(inferenceState.confidence! * 100).toStringAsFixed(0)}%'
-        : '--';
+    if (fromUpload) {
+      titleText = 'VIDEO PREDICTION';
+      displayLabel = uploadState.sentence!;
+      conf = '95%';
+    } else if (inferenceState.isRecording) {
+      titleText = 'GHI HÌNH';
+      displayLabel = 'Đang thu thập động tác...';
+    } else if (inferenceState.status == InferenceStatus.processingConversation) {
+      titleText = 'ĐANG DỊCH (GROQ)';
+      displayLabel = 'Đang ghép câu...';
+    } else if (inferenceState.conversationResult != null) {
+      titleText = 'LỜI THOẠI (GIAO TIẾP)';
+      displayLabel = inferenceState.conversationResult!;
+      conf = '90%';
+    } else {
+      titleText = inferenceState.status == InferenceStatus.result ? 'TỪ ĐIỂN' : 'SCANNING';
+      final rLabel = inferenceState.label;
+      displayLabel = rLabel != null ? (_vnLabelMap[rLabel] ?? rLabel) : 'Đang quét...';
+      if (inferenceState.confidence != null) {
+        conf = '${(inferenceState.confidence! * 100).toStringAsFixed(0)}%';
+      }
+    }
 
     return Container(
       decoration: BoxDecoration(
@@ -434,11 +445,7 @@ class _ResultCard extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            fromUpload
-                ? 'VIDEO PREDICTION'
-                : inferenceState.status == InferenceStatus.result
-                ? 'DETECTED'
-                : 'SCANNING',
+            titleText,
             style: TextStyle(
               color: Colors.white.withOpacity(0.7),
               fontSize: 12,
@@ -459,7 +466,7 @@ class _ResultCard extends StatelessWidget {
                     fontWeight: FontWeight.w800,
                     letterSpacing: 0.5,
                   ),
-                  maxLines: 2,
+                  maxLines: 4,
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
@@ -559,12 +566,19 @@ class _BottomNav extends ConsumerWidget {
                 },
               ),
             ),
-            const Expanded(
-              child: _NavItem(
-                icon: Icons.photo_camera,
-                label: 'Camera',
-                isActive: true,
-                onTap: _noop,
+            Expanded(
+              child: Consumer(
+                builder: (context, ref, child) {
+                  final mode = ref.watch(cameraModeProvider);
+                  return _NavItem(
+                    icon: Icons.photo_camera,
+                    label: mode == CameraMode.dictionary ? 'TỪ ĐIỂN' : 'GIAO TIẾP',
+                    isActive: true,
+                    onTap: () {
+                        ref.read(cameraModeProvider.notifier).toggle();
+                    },
+                  );
+                },
               ),
             ),
             const Expanded(
