@@ -20,6 +20,7 @@ class GroqService {
     "Xin chào, bạn khỏe không?",
     "Tôi bị đau ở đâu?",
     "Hẹn gặp lại bạn.",
+    "Mời bạn uống nước.",
   ];
 
   GroqService() {

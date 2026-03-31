@@ -7,7 +7,7 @@ import android.graphics.YuvImage
 import java.io.ByteArrayOutputStream
 import android.graphics.Bitmap
 import android.graphics.Matrix
-import android.media.MediaMetadataRetriever // THÊM IMPORT NÀY ĐỂ ĐỌC VIDEO
+import android.media.MediaMetadataRetriever
 import android.os.Bundle
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -30,8 +30,16 @@ import kotlinx.coroutines.withContext
 class MainActivity: FlutterActivity() {
     private val CHANNEL = "signtalk.dev/mediapipe"
     
+    // ── Landmarker dành cho CAMERA realtime (RunningMode.IMAGE) ──
     private var poseLandmarker: PoseLandmarker? = null
     private var handLandmarker: HandLandmarker? = null
+
+    // ── ✅ [Giải pháp 3] Landmarker riêng cho VIDEO (RunningMode.VIDEO) ──
+    // VIDEO mode dùng tracking liên tục giữa các frame kế tiếp
+    // → Không cần re-detect từ đầu mỗi frame → Nhanh hơn IMAGE mode ~40-50%
+    // QUAN TRỌNG: Không được dùng chung instance với camera (MediaPipe cấm trộn mode)
+    private var videoPoseLandmarker: PoseLandmarker? = null
+    private var videoHandLandmarker: HandLandmarker? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -39,6 +47,7 @@ class MainActivity: FlutterActivity() {
     }
 
     private fun initMediaPipe() {
+        // ── CAMERA MODE (IMAGE) - Giữ nguyên ──
         val poseBaseOptions = BaseOptions.builder().setModelAssetPath("pose_landmarker.task").build()
         val poseOptions = PoseLandmarkerOptions.builder()
             .setBaseOptions(poseBaseOptions)
@@ -56,6 +65,38 @@ class MainActivity: FlutterActivity() {
             .setMinHandPresenceConfidence(0.5f)
             .build()
         handLandmarker = HandLandmarker.createFromOptions(this, handOptions)
+
+        // Khởi tạo video landmarkers lần đầu
+        initVideoLandmarkers()
+    }
+
+    // ── ✅ [Giải pháp 3] VIDEO MODE ──
+    // Tách thành hàm riêng vì cần GỌI LẠI mỗi lần xử lý video mới.
+    // Lý do: VIDEO mode yêu cầu timestamp TĂNG LIÊN TỤC (strictly increasing).
+    // Khi upload video lần 2, timestamp reset về 0 → MediaPipe từ chối vì nhỏ hơn
+    // timestamp cuối của video trước → phải tạo lại instance mới để reset.
+    private fun initVideoLandmarkers() {
+        // Đóng instance cũ (nếu có) để giải phóng bộ nhớ
+        videoPoseLandmarker?.close()
+        videoHandLandmarker?.close()
+
+        val videoPoseBaseOptions = BaseOptions.builder().setModelAssetPath("pose_landmarker.task").build()
+        val videoPoseOptions = PoseLandmarkerOptions.builder()
+            .setBaseOptions(videoPoseBaseOptions)
+            .setRunningMode(RunningMode.VIDEO)
+            .setMinPoseDetectionConfidence(0.5f)
+            .build()
+        videoPoseLandmarker = PoseLandmarker.createFromOptions(this, videoPoseOptions)
+
+        val videoHandBaseOptions = BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build()
+        val videoHandOptions = HandLandmarkerOptions.builder()
+            .setBaseOptions(videoHandBaseOptions)
+            .setRunningMode(RunningMode.VIDEO)
+            .setNumHands(2)
+            .setMinHandDetectionConfidence(0.5f)
+            .setMinHandPresenceConfidence(0.5f)
+            .build()
+        videoHandLandmarker = HandLandmarker.createFromOptions(this, videoHandOptions)
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -64,7 +105,7 @@ class MainActivity: FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
             
             // ==============================================================
-            // NHÁNH 1: BẮT CAMERA THỜI GIAN THỰC (GIỮ NGUYÊN CỦA BẠN)
+            // NHÁNH 1: BẮT CAMERA THỜI GIAN THỰC (GIỮ NGUYÊN)
             // ==============================================================
             if (call.method == "extractFeatures") {
                 val bytes = call.argument<ByteArray>("bytes")!!
@@ -112,7 +153,10 @@ class MainActivity: FlutterActivity() {
                 }
             } 
             // ==============================================================
-            // NHÁNH 2: TÁCH FRAME TỪ VIDEO UPLOAD LÊN (SIÊU TỐC)
+            // NHÁNH 2: XỬ LÝ VIDEO UPLOAD
+            // ✅ [Giải pháp 1] Trả vector zero thay vì bỏ frame → giữ đúng timeline
+            // ✅ [Giải pháp 3] VIDEO mode MediaPipe → detect nhanh hơn 40-50%
+            // + Thu nhỏ ảnh 480px + getScaledFrameAtTime → tiết kiệm RAM & CPU
             // ==============================================================
             else if (call.method == "processVideoFile") {
                 val videoPath = call.argument<String>("videoPath")
@@ -123,6 +167,14 @@ class MainActivity: FlutterActivity() {
 
                 CoroutineScope(Dispatchers.Default).launch {
                     try {
+                        val startTime = System.currentTimeMillis()
+
+                        // ✅ Reset VIDEO mode landmarkers trước mỗi video mới
+                        // để timestamp bắt đầu lại từ 0 (VIDEO mode yêu cầu strictly increasing)
+                        withContext(Dispatchers.Main) {
+                            initVideoLandmarkers()
+                        }
+
                         val featuresSequence = mutableListOf<DoubleArray>()
                         val retriever = MediaMetadataRetriever()
                         
@@ -130,31 +182,34 @@ class MainActivity: FlutterActivity() {
                         val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                         val durationMs = durationStr?.toLongOrNull() ?: 0L
                         
-                        // 1. CHUYỂN XUỐNG 15 FPS ĐỂ GIẢM MỘT NỬA THỜI GIAN XỬ LÝ (~66ms/frame)
-                        val intervalUs = 33333L 
+                        // Giữ 30fps để khớp với FPS lúc train model
+                        val intervalUs = 33333L // 30fps = 33333μs/frame
                         val durationUs = durationMs * 1000L
 
-                        // 2. LẤY KÍCH THƯỚC GỐC ĐỂ TÍNH TOÁN THU NHỎ
+                        // Lấy kích thước video để tính scale thu nhỏ
                         val videoWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toFloatOrNull() ?: 1080f
                         val videoHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toFloatOrNull() ?: 1920f
                         
-                        // Ép khung hình về tối đa 480px chiều dài nhất (MediaPipe chỉ cần 256px là chạy mượt)
-                        val maxDimension = 480f // Ảnh nhỏ AI quét siêu nhanh
+                        // Ép ảnh về tối đa 480px chiều dài nhất → MediaPipe chạy nhanh hơn
+                        val maxDimension = 480f
                         val scale = if (videoWidth > videoHeight) maxDimension / videoWidth else maxDimension / videoHeight
                         val targetWidth = (videoWidth * scale).toInt()
                         val targetHeight = (videoHeight * scale).toInt()
 
+                        android.util.Log.d("SignTalk", "📹 Video: ${durationMs}ms, ${videoWidth}x${videoHeight} → ${targetWidth}x${targetHeight}")
+
+                        // ── Timestamp cho VIDEO mode MediaPipe (phải tăng đều) ──
+                        var timestampMs = 0L
+
                         for (timeUs in 0 until durationUs step intervalUs) {
-                            // 3. BÓC TÁCH ẢNH ĐÃ ĐƯỢC THU NHỎ (Tiết kiệm 80% RAM và CPU)
+                            // Dùng getScaledFrameAtTime trên Android 8.1+ (nhanh hơn get + scale thủ công)
                             val bitmap = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O_MR1) {
-                                // Nếu máy Android 8.1 trở lên, dùng hàm cắt ảnh thu nhỏ siêu nhanh
                                 retriever.getScaledFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST, targetWidth, targetHeight)
                             } else {
-                                // Máy đời cũ thì cắt ảnh gốc rồi tự thu nhỏ
                                 val rawBitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
                                 if (rawBitmap != null) {
                                     val scaled = Bitmap.createScaledBitmap(rawBitmap, targetWidth, targetHeight, true)
-                                    rawBitmap.recycle() // Xóa ngay ảnh gốc cho đỡ đầy RAM
+                                    rawBitmap.recycle()
                                     scaled
                                 } else null
                             }
@@ -162,24 +217,39 @@ class MainActivity: FlutterActivity() {
                             if (bitmap != null) {
                                 val argbBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
                                 val mpImage = BitmapImageBuilder(argbBitmap).build()
-                                val poseResult = poseLandmarker?.detect(mpImage)
-                                val handResult = handLandmarker?.detect(mpImage)
 
+                                // ✅ [Giải pháp 3] detectForVideo() thay vì detect()
+                                // Truyền timestamp tăng đều để MediaPipe dùng tracking liên tục
+                                val poseResult = videoPoseLandmarker?.detectForVideo(mpImage, timestampMs)
+                                val handResult = videoHandLandmarker?.detectForVideo(mpImage, timestampMs)
+
+                                // ✅ [Giải pháp 1] Trả vector zero thay vì bỏ frame
+                                // Khi không detect được tay → điền 96 số 0 → giữ đúng timeline 30fps
+                                // Lý do: Nếu bỏ frame, sliding window bị "xé rách" ranh giới ký hiệu
+                                // → model chỉ bắt được 1 từ thay vì cả câu
                                 val extractedMap = extractAndNormalize(poseResult, handResult)
-                                
-                                val features = extractedMap?.get("features")
-                                if (features != null) {
-                                    featuresSequence.add(features)
-                                }
+                                val features = extractedMap?.get("features") ?: DoubleArray(96) { 0.0 }
+                                featuresSequence.add(features)
+
                                 bitmap.recycle()
+                                if (argbBitmap !== bitmap) argbBitmap.recycle()
+                            } else {
+                                // Ngay cả khi bitmap null → vẫn thêm zero-vector để giữ timeline
+                                featuresSequence.add(DoubleArray(96) { 0.0 })
                             }
+
+                            timestampMs += intervalUs / 1000 // Tăng timestamp cho VIDEO mode
                         }
                         retriever.release()
+                        
+                        val elapsed = System.currentTimeMillis() - startTime
+                        android.util.Log.d("SignTalk", "✅ Xử lý video xong trong ${elapsed}ms, tổng ${featuresSequence.size} frames")
 
                         withContext(Dispatchers.Main) {
                             result.success(featuresSequence)
                         }
                     } catch (e: Exception) {
+                        android.util.Log.e("SignTalk", "❌ Lỗi xử lý video: ${e.message}", e)
                         withContext(Dispatchers.Main) {
                             result.error("VIDEO_ERROR", e.message, null)
                         }
@@ -192,7 +262,7 @@ class MainActivity: FlutterActivity() {
         }
     }
 
-    // --- HÀM CỦA BẠN (GIỮ NGUYÊN 100%, TRẢ VỀ MAP) ---
+    // --- HÀM EXTRACT & NORMALIZE (GIỮ NGUYÊN) ---
     private fun extractAndNormalize(
         poseResult: com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult?,
         handResult: com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult?

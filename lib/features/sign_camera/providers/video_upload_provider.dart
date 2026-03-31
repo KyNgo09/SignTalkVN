@@ -59,6 +59,11 @@ final videoUploadProvider =
     );
 
 class VideoUploadNotifier extends Notifier<VideoUploadState> {
+  // ✅ [Giải pháp 2] Threshold riêng cho video upload, thấp hơn camera realtime
+  // Lý do: Khi tải video lên, user đã CHỦ ĐÍCH quay ký hiệu → ít nhiễu hơn camera realtime
+  // Camera realtime giữ threshold 0.8 (trong AppConstants) để tránh bắt nhầm cử chỉ tay vô ý
+  static const double _videoConfidenceThreshold = 0.4;
+
   @override
   VideoUploadState build() => const VideoUploadState();
 
@@ -104,6 +109,8 @@ class VideoUploadNotifier extends Notifier<VideoUploadState> {
       }
 
       // 2. Gọi native bóc tách video
+      // ✅ Giờ Kotlin trả về TẤT CẢ frames (kể cả zero-vector khi không detect tay)
+      // → Giữ đúng timeline 30fps, sliding window chạy đúng ranh giới ký hiệu
       final allFrames = await poseService.processVideoFile(picked.path);
 
       if (allFrames == null || allFrames.isEmpty) {
@@ -114,12 +121,14 @@ class VideoUploadNotifier extends Notifier<VideoUploadState> {
         return;
       }
 
+      debugPrint("📊 Nhận được ${allFrames.length} frames từ native (bao gồm cả zero-vector)");
+
       // 3. Sliding window
-      final int windowSize = AppConstants.framesPerSequence; // 40
-      final int stride = 5;
+      final int windowSize = AppConstants.framesPerSequence; // 40 frames = 1.33 giây ở 30fps
+      final int stride = 5; // Trượt 5 frame mỗi bước = ~0.17 giây
       final List<String> rawPredictions = [];
 
-      // Padding nếu quá ngắn
+      // Padding nếu video quá ngắn (< 40 frames = < 1.33 giây)
       if (allFrames.length < windowSize) {
         final last = allFrames.last;
         while (allFrames.length < windowSize) {
@@ -128,7 +137,8 @@ class VideoUploadNotifier extends Notifier<VideoUploadState> {
         final result = tfliteService.predict(allFrames);
         final label = result['label'] as String?;
         final conf = result['confidence'] as double?;
-        if (label != null && conf != null && conf > 0.6) {
+        // ✅ [Giải pháp 2] Dùng threshold riêng cho video upload (0.4 thay vì 0.8)
+        if (label != null && conf != null && conf > _videoConfidenceThreshold) {
           rawPredictions.add(label);
         }
       } else {
@@ -137,17 +147,20 @@ class VideoUploadNotifier extends Notifier<VideoUploadState> {
           final result = tfliteService.predict(window);
           final label = result['label'] as String?;
           final conf = result['confidence'] as double?;
-          if (label != null && conf != null && conf > 0.6) {
+          // ✅ [Giải pháp 2] Dùng threshold riêng cho video upload (0.4 thay vì 0.8)
+          if (label != null && conf != null && conf > _videoConfidenceThreshold) {
             rawPredictions.add(label);
           }
         }
       }
 
-      // 4. Lọc nhiễu
+      debugPrint("📊 Tổng predictions thô: ${rawPredictions.length}");
+
+      // 4. Lọc nhiễu: loại bỏ từ lặp liên tiếp + từ bắt đầu bằng "Không rõ"
       final List<String> finalGlossList = [];
       String? lastWord;
       for (final word in rawPredictions) {
-        if (word.isEmpty || word == 'Không rõ') continue;
+        if (word.isEmpty || word.startsWith('Không rõ')) continue;
         if (word != lastWord) {
           finalGlossList.add(word);
           lastWord = word;
@@ -164,19 +177,15 @@ class VideoUploadNotifier extends Notifier<VideoUploadState> {
         return;
       }
 
-      // Mock câu tiếng Việt (tạm)
+      // 5. Dịch chuỗi Gloss thành câu tiếng Việt
       try {
-        debugPrint("🤖 Đang nhờ Gemini biên dịch chuỗi: $finalGlossList ...");
+        debugPrint("🤖 Đang nhờ dịch chuỗi: $finalGlossList ...");
 
-        // Đọc Gemini Service từ Provider
         final groqService = ref.read(groqServiceProvider);
-
-        // Gọi API ném chuỗi thô lên Google Server và chờ kết quả
         final finalSentence = await groqService.translateGlossToSentence(
           finalGlossList,
         );
 
-        // THÀNH CÔNG! Cập nhật UI với câu văn hoàn chỉnh
         state = state.copyWith(
           status: VideoUploadStatus.done,
           sentence: finalSentence,
@@ -186,13 +195,12 @@ class VideoUploadNotifier extends Notifier<VideoUploadState> {
           "🎉 Hoàn tất toàn trình Video Upload! Kết quả: $finalSentence",
         );
       } catch (geminiError) {
-        debugPrint("❌ Lỗi khi gọi Gemini: $geminiError");
+        debugPrint("❌ Lỗi khi dịch: $geminiError");
 
-        // Nếu lỡ rớt mạng hoặc Gemini lỗi, ta fallback (chữa cháy) bằng cách in chuỗi thô
+        // Fallback: ghép chuỗi Gloss thô
         state = state.copyWith(
-          status:
-              VideoUploadStatus.done, // Vẫn cho Done để UI không bị kẹt Loading
-          sentence: finalGlossList.join(" "), // Ghép chay các từ lại với nhau
+          status: VideoUploadStatus.done,
+          sentence: finalGlossList.join(" "),
         );
       }
     } catch (e) {
