@@ -155,7 +155,23 @@ class VideoUploadNotifier extends Notifier<VideoUploadState> {
       if (frames10fps == null || frames10fps.isEmpty) {
         state = state.copyWith(
           status: VideoUploadStatus.error,
-          errorMessage: 'Không tìm thấy cử chỉ tay nào trong video này.',
+          errorMessage: 'Không thể phân tích video này.',
+        );
+        return;
+      }
+
+      // Đếm số frame có dữ liệu thực (khác mảng toàn số 0 do không thấy người/tay)
+      int validFrameCount = 0;
+      for (final frame in frames10fps) {
+        if (frame.any((val) => val != 0.0)) {
+          validFrameCount++;
+        }
+      }
+
+      if (validFrameCount < 2) {
+        state = state.copyWith(
+          status: VideoUploadStatus.error,
+          errorMessage: 'Không tìm thấy cử chỉ tay nào trong video.',
         );
         return;
       }

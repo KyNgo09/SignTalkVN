@@ -412,13 +412,22 @@ class _ResultCard extends StatelessWidget {
     final bool fromUpload =
         uploadState.status == VideoUploadStatus.done &&
         (uploadState.sentence?.isNotEmpty ?? false);
+    final bool uploadError = uploadState.status == VideoUploadStatus.error;
+    final bool isProcessingUpload = uploadState.status == VideoUploadStatus.processing;
 
     late String displayLabel;
     late String titleText;
     String conf = '--';
 
-    if (fromUpload) {
-      titleText = 'VIDEO PREDICTION';
+    if (uploadError && uploadState.errorMessage != null) {
+      titleText = 'LỖI XỬ LÝ VIDEO';
+      displayLabel = uploadState.errorMessage!;
+      conf = 'N/A';
+    } else if (isProcessingUpload) {
+      titleText = 'ĐANG PHÂN TÍCH VIDEO';
+      displayLabel = 'Vui lòng đợi...';
+    } else if (fromUpload) {
+      titleText = 'KẾT QUẢ VIDEO';
       displayLabel = uploadState.sentence!;
       conf = '95%';
     } else if (inferenceState.isRecording) {
