@@ -26,6 +26,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 
 class MainActivity: FlutterActivity() {
     private val CHANNEL = "signtalk.dev/mediapipe"
@@ -34,12 +36,17 @@ class MainActivity: FlutterActivity() {
     private var poseLandmarker: PoseLandmarker? = null
     private var handLandmarker: HandLandmarker? = null
 
-    // ── ✅ [Giải pháp 3] Landmarker riêng cho VIDEO (RunningMode.VIDEO) ──
+    // ── Landmarker riêng cho VIDEO (RunningMode.VIDEO) ──
     // VIDEO mode dùng tracking liên tục giữa các frame kế tiếp
     // → Không cần re-detect từ đầu mỗi frame → Nhanh hơn IMAGE mode ~40-50%
-    // QUAN TRỌNG: Không được dùng chung instance với camera (MediaPipe cấm trộn mode)
     private var videoPoseLandmarker: PoseLandmarker? = null
     private var videoHandLandmarker: HandLandmarker? = null
+
+    // ── Offset timestamp để không cần recreate landmarkers mỗi video ──
+    // VIDEO mode yêu cầu timestamp STRICTLY INCREASING.
+    // Thay vì tạo lại 2 model (~1-2s mỗi lần), ta tích lũy offset liên tục.
+    // Video 1: timestamp 0..4000ms → Video 2: timestamp 5000..9000ms → ...
+    private var videoTimestampOffsetMs = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -169,11 +176,9 @@ class MainActivity: FlutterActivity() {
                     try {
                         val startTime = System.currentTimeMillis()
 
-                        // ✅ Reset VIDEO mode landmarkers trước mỗi video mới
-                        // để timestamp bắt đầu lại từ 0 (VIDEO mode yêu cầu strictly increasing)
-                        withContext(Dispatchers.Main) {
-                            initVideoLandmarkers()
-                        }
+                        // ✅ Tăng offset thêm 10s để timestamp luôn tăng giữa các video
+                        // Thay vì recreate 2 model MediaPipe (~1-2s), chỉ cần shift timestamp
+                        videoTimestampOffsetMs += 10000L
 
                         val featuresSequence = mutableListOf<DoubleArray>()
                         val retriever = MediaMetadataRetriever()
@@ -182,16 +187,20 @@ class MainActivity: FlutterActivity() {
                         val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                         val durationMs = durationStr?.toLongOrNull() ?: 0L
                         
-                        // Giữ 30fps để khớp với FPS lúc train model
-                        val intervalUs = 33333L // 30fps = 33333μs/frame
+                        // ✅ EXTRACT ở 10fps thay vì 30fps → giảm 3x số frame cần seek
+                        // Mỗi lần getFrameAtTime tốn ~250ms (từ log thực tế)
+                        // 30fps: 150 frames × 250ms = ~37s | 10fps: 50 frames × 250ms = ~12s
+                        // Phía Dart sẽ NỘI SUY lên 30fps để khớp model BiLSTM
+                        val intervalUs = 100000L // 10fps = 100000μs/frame (100ms)
                         val durationUs = durationMs * 1000L
 
                         // Lấy kích thước video để tính scale thu nhỏ
                         val videoWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toFloatOrNull() ?: 1080f
                         val videoHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toFloatOrNull() ?: 1920f
                         
-                        // Ép ảnh về tối đa 480px chiều dài nhất → MediaPipe chạy nhanh hơn
-                        val maxDimension = 480f
+                        // Ép ảnh về tối đa 320px → MediaPipe chạy nhanh hơn ~30%
+                        // MediaPipe chỉ cần ~256px để detect chính xác
+                        val maxDimension = 320f
                         val scale = if (videoWidth > videoHeight) maxDimension / videoWidth else maxDimension / videoHeight
                         val targetWidth = (videoWidth * scale).toInt()
                         val targetHeight = (videoHeight * scale).toInt()
@@ -199,7 +208,8 @@ class MainActivity: FlutterActivity() {
                         android.util.Log.d("SignTalk", "📹 Video: ${durationMs}ms, ${videoWidth}x${videoHeight} → ${targetWidth}x${targetHeight}")
 
                         // ── Timestamp cho VIDEO mode MediaPipe (phải tăng đều) ──
-                        var timestampMs = 0L
+                        // Dùng offset tích lũy để không cần recreate landmarkers
+                        var timestampMs = videoTimestampOffsetMs
 
                         for (timeUs in 0 until durationUs step intervalUs) {
                             // Dùng getScaledFrameAtTime trên Android 8.1+ (nhanh hơn get + scale thủ công)
@@ -218,10 +228,13 @@ class MainActivity: FlutterActivity() {
                                 val argbBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
                                 val mpImage = BitmapImageBuilder(argbBitmap).build()
 
-                                // ✅ [Giải pháp 3] detectForVideo() thay vì detect()
-                                // Truyền timestamp tăng đều để MediaPipe dùng tracking liên tục
-                                val poseResult = videoPoseLandmarker?.detectForVideo(mpImage, timestampMs)
-                                val handResult = videoHandLandmarker?.detectForVideo(mpImage, timestampMs)
+                                // ✅ Chạy Pose + Hand detect SONG SONG
+                                // Thay vì tuần tự (pose 100ms rồi hand 100ms = 200ms),
+                                // chạy 2 coroutine đồng thời → overlap → ~120ms/frame
+                                val poseDeferred = async { videoPoseLandmarker?.detectForVideo(mpImage, timestampMs) }
+                                val handDeferred = async { videoHandLandmarker?.detectForVideo(mpImage, timestampMs) }
+                                val poseResult = poseDeferred.await()
+                                val handResult = handDeferred.await()
 
                                 // ✅ [Giải pháp 1] Trả vector zero thay vì bỏ frame
                                 // Khi không detect được tay → điền 96 số 0 → giữ đúng timeline 30fps

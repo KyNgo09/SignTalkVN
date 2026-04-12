@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
 import 'package:video_player/video_player.dart';
@@ -8,6 +9,8 @@ import 'package:video_player/video_player.dart';
 import '../providers/camera_provider.dart';
 import '../providers/inference_provider.dart';
 import '../providers/video_upload_provider.dart';
+import '../../settings/providers/settings_provider.dart';
+import '../../settings/presentation/settings_screen.dart';
 import '../widgets/landmark_painter.dart';
 
 class CameraScreen extends ConsumerWidget {
@@ -17,7 +20,8 @@ class CameraScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final cameraState = ref.watch(cameraProvider);
     final inferenceState = ref.watch(inferenceProvider);
-    final uploadState = ref.watch(videoUploadProvider); // <- thêm
+    final uploadState = ref.watch(videoUploadProvider); 
+    final settingsState = ref.watch(settingsProvider);
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -44,7 +48,7 @@ class CameraScreen extends ConsumerWidget {
                         child: _CameraSurface(
                           controller: controller,
                           uploadState: uploadState,
-                          landmarks: inferenceState.landmarks ?? const [],
+                          landmarks: settingsState.showSkeleton ? (inferenceState.landmarks ?? const []) : const [],
                           onCloseVideo: () => ref
                               .read(videoUploadProvider.notifier)
                               .clearVideo(),
@@ -220,7 +224,7 @@ class _CameraSurfaceState extends State<_CameraSurface> {
             fit: StackFit.expand,
             children: [
               CameraPreview(widget.controller),
-              CustomPaint(painter: LandmarkPainter(widget.landmarks)),
+              _AnimatedLandmarkOverlay(landmarks: widget.landmarks),
               _CornersOverlay(),
             ],
           )
@@ -581,12 +585,18 @@ class _BottomNav extends ConsumerWidget {
                 },
               ),
             ),
-            const Expanded(
+            Expanded(
               child: _NavItem(
                 icon: Icons.settings,
-                label: 'Settings',
+                label: 'Cài đặt',
                 isActive: false,
-                onTap: _noop,
+                onTap: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => const SettingsScreen(),
+                    ),
+                  );
+                },
               ),
             ),
           ],
@@ -711,6 +721,125 @@ class _CircleIcon extends StatelessWidget {
         ),
         child: Icon(icon, color: Colors.white, size: 22),
       ),
+    );
+  }
+}
+// ═══════════════════════════════════════════════════════════════
+// ✅ Skeleton mượt 60fps — Exponential Smoothing + Ticker
+// ═══════════════════════════════════════════════════════════════
+// Cách tiếp cận giống AR apps chuyên nghiệp:
+// 1. Ticker chạy liên tục ở 60fps
+// 2. Mỗi tick: di chuyển vị trí ĐANG HIỂN THỊ về phía TARGET
+//    bằng exponential moving average (EMA)
+// 3. Chỉ repaint canvas (qua ChangeNotifier), KHÔNG rebuild widget
+//
+// Ưu điểm so với AnimationController:
+// - Không bị bug "nhảy cóc" khi data mới đến giữa animation
+// - Tự nhiên hơn — skeleton "đuổi theo" vị trí tay thực tế
+// - Hiệu suất cao nhất — chỉ canvas.drawXxx() chạy lại
+class _AnimatedLandmarkOverlay extends StatefulWidget {
+  final List<double> landmarks;
+  const _AnimatedLandmarkOverlay({required this.landmarks});
+
+  @override
+  State<_AnimatedLandmarkOverlay> createState() => _AnimatedLandmarkOverlayState();
+}
+
+class _AnimatedLandmarkOverlayState extends State<_AnimatedLandmarkOverlay>
+    with SingleTickerProviderStateMixin {
+  late Ticker _ticker;
+  late SmoothLandmarkPainter _painter;
+
+  List<double> _displayed = [];
+  List<double> _target = [];
+
+  // ── Smoothing ──
+  // 0.55 = cân bằng giữa responsive và chống giật
+  // (dead zone filter bên dưới sẽ loại bỏ micro-jitter mà smooth không xử lý được)
+  static const double _smoothFactor = 0.55;
+
+  // ── Dead zone: bỏ qua di chuyển nhỏ hơn ngưỡng này ──
+  // MediaPipe detect cùng 1 vị trí tay nhưng landmark dao động ±0.5-1%
+  // → Skeleton rung lắc dù tay đứng yên
+  // Ngưỡng 0.008 ≈ 0.8% canvas → bỏ qua noise, giữ chuyển động thật
+  static const double _deadZone = 0.008;
+
+  // ── Flicker protection: chờ N frame trước khi xóa skeleton ──
+  // MediaPipe đôi khi mất tracking 1-2 frame rồi detect lại
+  // → Skeleton nhấp nháy (hiện → mất → hiện)
+  // Giữ skeleton thêm 5 frame (~80ms) trước khi xóa
+  int _emptyFrameCount = 0;
+  static const int _flickerGuardFrames = 5;
+
+  @override
+  void initState() {
+    super.initState();
+    _painter = SmoothLandmarkPainter();
+    _ticker = createTicker(_onTick);
+    _ticker.start();
+  }
+
+  void _onTick(Duration elapsed) {
+    if (_target.isEmpty || _target.length != 96) {
+      // Flicker protection: chờ vài frame trước khi thực sự xóa skeleton
+      if (_displayed.isNotEmpty) {
+        _emptyFrameCount++;
+        if (_emptyFrameCount > _flickerGuardFrames) {
+          _displayed = [];
+          _painter.update([]);
+        }
+      }
+      return;
+    }
+
+    _emptyFrameCount = 0; // Reset counter khi có data
+
+    // Lần đầu nhận data → snap ngay
+    if (_displayed.isEmpty || _displayed.length != 96) {
+      _displayed = List<double>.from(_target);
+      _painter.update(_displayed);
+      return;
+    }
+
+    // Exponential smoothing + Dead zone filter
+    bool hasChange = false;
+    for (int i = 0; i < 96; i++) {
+      final diff = _target[i] - _displayed[i];
+
+      // Dead zone: bỏ qua micro-movements (MediaPipe noise)
+      if (diff.abs() > _deadZone) {
+        _displayed[i] += diff * _smoothFactor;
+        hasChange = true;
+      }
+    }
+
+    if (hasChange) {
+      _painter.update(_displayed);
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant _AnimatedLandmarkOverlay oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.landmarks.isNotEmpty) {
+      _target = widget.landmarks;
+    } else {
+      _target = [];
+    }
+  }
+
+  @override
+  void dispose() {
+    _ticker.dispose();
+    _painter.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Widget tree chỉ build 1 LẦN — mọi update qua _painter.notifyListeners()
+    return RepaintBoundary(
+      child: CustomPaint(painter: _painter),
     );
   }
 }

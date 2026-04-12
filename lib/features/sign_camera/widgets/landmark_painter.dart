@@ -1,77 +1,105 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart'; // thêm
+import 'dart:ui' as ui;
 
-class LandmarkPainter extends CustomPainter {
-  final List<double> landmarks;
+// ═══════════════════════════════════════════════════════════════
+// Painter vẽ skeleton — chỉ repaint, KHÔNG rebuild widget tree
+// ═══════════════════════════════════════════════════════════════
+// Dùng ChangeNotifier qua tham số `repaint` của CustomPaint
+// → khi gọi notifyListeners(), chỉ canvas.drawXxx() chạy lại
+// → widget tree giữ nguyên → hiệu suất tối đa
+class SmoothLandmarkPainter extends ChangeNotifier implements CustomPainter {
+  List<double> _landmarks = [];
 
-  LandmarkPainter(this.landmarks);
+  void update(List<double> landmarks) {
+    _landmarks = landmarks;
+    notifyListeners(); // Chỉ trigger repaint, không rebuild widget
+  }
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (landmarks.isEmpty || landmarks.length != 96) return;
-
-    final paintPoint = Paint()
-      ..color = Colors.redAccent
-      ..strokeWidth = 4
-      ..style = PaintingStyle.fill;
-
-    final paintLine = Paint()
-      ..color = Colors.yellowAccent
-      ..strokeWidth = 2
-      ..style = PaintingStyle.stroke;
+    if (_landmarks.isEmpty || _landmarks.length != 96) return;
 
     final points = <Offset>[];
-    for (int i = 0; i < landmarks.length; i += 2) {
-      final x = landmarks[i] * size.width;
-      final y = landmarks[i + 1] * size.height;
+    for (int i = 0; i < _landmarks.length; i += 2) {
+      final x = _landmarks[i] * size.width;
+      final y = _landmarks[i + 1] * size.height;
       points.add(Offset(x, y));
     }
 
-    _drawHand(canvas, points.sublist(6, 27), paintLine, paintPoint);
-    _drawHand(canvas, points.sublist(27, 48), paintLine, paintPoint);
+    // Layout: [0-5] Pose, [6-26] Left Hand, [27-47] Right Hand
+    _drawPose(canvas, points);
+    _drawHand(canvas, points, 6, 27);
+    _drawHand(canvas, points, 27, 48);
   }
 
-  void _drawHand(
-    Canvas canvas,
-    List<Offset> handPoints,
-    Paint paintLine,
-    Paint paintPoint,
-  ) {
-    if (handPoints[0].dx == 0 && handPoints[0].dy == 0) return;
+  void _drawPose(Canvas canvas, List<Offset> points) {
+    if (_isZero(points[0]) && _isZero(points[1])) return;
 
-    final connections = [
-      [0, 1],
-      [1, 2],
-      [2, 3],
-      [3, 4],
-      [0, 5],
-      [5, 6],
-      [6, 7],
-      [7, 8],
-      [9, 10],
-      [10, 11],
-      [11, 12],
-      [13, 14],
-      [14, 15],
-      [15, 16],
-      [17, 18],
-      [18, 19],
-      [19, 20],
-      [5, 9],
-      [9, 13],
-      [13, 17],
-      [0, 17],
+    final paintBone = Paint()
+      ..color = const Color(0xFF00E5FF)
+      ..strokeWidth = 3.0
+      ..strokeCap = StrokeCap.round;
+
+    final paintJoint = Paint()
+      ..color = const Color(0xFF00E5FF)
+      ..style = PaintingStyle.fill;
+
+    const connections = [[0,1],[0,2],[2,4],[1,3],[3,5]];
+    for (final c in connections) {
+      if (!_isZero(points[c[0]]) && !_isZero(points[c[1]])) {
+        canvas.drawLine(points[c[0]], points[c[1]], paintBone);
+      }
+    }
+    for (int i = 0; i < 6; i++) {
+      if (!_isZero(points[i])) {
+        canvas.drawCircle(points[i], i < 2 ? 5.0 : 3.5, paintJoint);
+      }
+    }
+  }
+
+  void _drawHand(Canvas canvas, List<Offset> all, int start, int end) {
+    final hp = all.sublist(start, end);
+    if (_isZero(hp[0])) return;
+
+    final paintLine = Paint()
+      ..color = const Color(0xFFFFD740)
+      ..strokeWidth = 2.0
+      ..strokeCap = StrokeCap.round;
+
+    final paintDot = Paint()
+      ..color = const Color(0xFFFF5252)
+      ..style = PaintingStyle.fill;
+
+    const conn = [
+      [0,1],[1,2],[2,3],[3,4],
+      [0,5],[5,6],[6,7],[7,8],
+      [9,10],[10,11],[11,12],
+      [13,14],[14,15],[15,16],
+      [17,18],[18,19],[19,20],
+      [5,9],[9,13],[13,17],[0,17],
     ];
-
-    for (var conn in connections) {
-      canvas.drawLine(handPoints[conn[0]], handPoints[conn[1]], paintLine);
+    for (final c in conn) {
+      if (!_isZero(hp[c[0]]) && !_isZero(hp[c[1]])) {
+        canvas.drawLine(hp[c[0]], hp[c[1]], paintLine);
+      }
     }
-    for (var p in handPoints) {
-      canvas.drawCircle(p, 3, paintPoint);
+    for (final p in hp) {
+      if (!_isZero(p)) canvas.drawCircle(p, 2.5, paintDot);
     }
   }
+
+  bool _isZero(Offset p) => p.dx == 0 && p.dy == 0;
+
+  // ── CustomPainter interface ──
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false; // Dùng notifyListeners thay thế
 
   @override
-  bool shouldRepaint(covariant LandmarkPainter oldDelegate) =>
-      !listEquals(oldDelegate.landmarks, landmarks);
+  bool? hitTest(Offset position) => null;
+
+  @override
+  SemanticsBuilderCallback? get semanticsBuilder => null;
+
+  @override
+  bool shouldRebuildSemantics(covariant CustomPainter oldDelegate) => false;
 }

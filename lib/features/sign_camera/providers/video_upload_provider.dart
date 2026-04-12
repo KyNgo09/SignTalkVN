@@ -59,9 +59,8 @@ final videoUploadProvider =
     );
 
 class VideoUploadNotifier extends Notifier<VideoUploadState> {
-  // ✅ [Giải pháp 2] Threshold riêng cho video upload, thấp hơn camera realtime
-  // Lý do: Khi tải video lên, user đã CHỦ ĐÍCH quay ký hiệu → ít nhiễu hơn camera realtime
-  // Camera realtime giữ threshold 0.8 (trong AppConstants) để tránh bắt nhầm cử chỉ tay vô ý
+  // Threshold riêng cho video upload, thấp hơn camera realtime
+  // Camera realtime giữ threshold 0.8 (trong AppConstants) để tránh bắt nhầm cử chỉ vô ý
   static const double _videoConfidenceThreshold = 0.4;
 
   @override
@@ -69,6 +68,48 @@ class VideoUploadNotifier extends Notifier<VideoUploadState> {
 
   void clearVideo() {
     state = const VideoUploadState(status: VideoUploadStatus.idle);
+  }
+
+  // =========================================================================
+  // NỘI SUY 10fps lên 30fps để khớp model BiLSTM (train ở 30fps)
+  // =========================================================================
+  // Giữa 2 frame thực (cách nhau 100ms), tạo thêm 2 frame trung gian
+  // bằng linear interpolation trên 96 features.
+  //
+  // Ví dụ: Frame A (t=0ms) và Frame B (t=100ms)
+  //   → Frame t=33ms:  features = A + (B - A) × 0.33
+  //   → Frame t=66ms:  features = A + (B - A) × 0.67
+  //   → Frame t=100ms: features = B (frame thực)
+  //
+  // Tại sao hoạt động: ký hiệu tay di chuyển liên tục (không teleport),
+  // nên linear interpolation giữa 2 vị trí cách nhau 100ms là chính xác.
+  // Model BiLSTM nhìn cả chuỗi 40 frame nên dung sai nhỏ không ảnh hưởng.
+  List<List<double>> _interpolateTo30fps(List<List<double>> frames10fps) {
+    if (frames10fps.length <= 1) return frames10fps;
+
+    final List<List<double>> result = [];
+    final int featureCount = frames10fps[0].length; // 96
+
+    for (int i = 0; i < frames10fps.length - 1; i++) {
+      final frameA = frames10fps[i];
+      final frameB = frames10fps[i + 1];
+
+      // Thêm frame gốc A
+      result.add(frameA);
+
+      // Tạo 2 frame nội suy giữa A và B (tại t=0.33 và t=0.67)
+      for (final ratio in [1.0 / 3.0, 2.0 / 3.0]) {
+        final interpolated = List<double>.generate(featureCount, (k) {
+          return frameA[k] + (frameB[k] - frameA[k]) * ratio;
+        });
+        result.add(interpolated);
+      }
+    }
+
+    // Thêm frame cuối cùng
+    result.add(frames10fps.last);
+
+    return result;
   }
 
   Future<void> pickAndProcess() async {
@@ -108,12 +149,10 @@ class VideoUploadNotifier extends Notifier<VideoUploadState> {
         await tfliteService.initialize();
       }
 
-      // 2. Gọi native bóc tách video
-      // ✅ Giờ Kotlin trả về TẤT CẢ frames (kể cả zero-vector khi không detect tay)
-      // → Giữ đúng timeline 30fps, sliding window chạy đúng ranh giới ký hiệu
-      final allFrames = await poseService.processVideoFile(picked.path);
+      // 2. Gọi native bóc tách video (10fps)
+      final frames10fps = await poseService.processVideoFile(picked.path);
 
-      if (allFrames == null || allFrames.isEmpty) {
+      if (frames10fps == null || frames10fps.isEmpty) {
         state = state.copyWith(
           status: VideoUploadStatus.error,
           errorMessage: 'Không tìm thấy cử chỉ tay nào trong video này.',
@@ -121,9 +160,14 @@ class VideoUploadNotifier extends Notifier<VideoUploadState> {
         return;
       }
 
-      debugPrint("📊 Nhận được ${allFrames.length} frames từ native (bao gồm cả zero-vector)");
+      debugPrint("📊 Nhận ${frames10fps.length} frames @10fps từ native");
 
-      // 3. Sliding window
+      // 3. ✅ NỘI SUY lên 30fps để khớp model BiLSTM
+      // 10fps → 30fps: mỗi khoảng 100ms tạo thêm 2 frame trung gian
+      final allFrames = _interpolateTo30fps(frames10fps);
+      debugPrint("📊 Sau nội suy: ${allFrames.length} frames @30fps");
+
+      // 4. Sliding window
       final int windowSize = AppConstants.framesPerSequence; // 40 frames = 1.33 giây ở 30fps
       final int stride = 5; // Trượt 5 frame mỗi bước = ~0.17 giây
       final List<String> rawPredictions = [];
@@ -137,7 +181,6 @@ class VideoUploadNotifier extends Notifier<VideoUploadState> {
         final result = tfliteService.predict(allFrames);
         final label = result['label'] as String?;
         final conf = result['confidence'] as double?;
-        // ✅ [Giải pháp 2] Dùng threshold riêng cho video upload (0.4 thay vì 0.8)
         if (label != null && conf != null && conf > _videoConfidenceThreshold) {
           rawPredictions.add(label);
         }
@@ -147,7 +190,6 @@ class VideoUploadNotifier extends Notifier<VideoUploadState> {
           final result = tfliteService.predict(window);
           final label = result['label'] as String?;
           final conf = result['confidence'] as double?;
-          // ✅ [Giải pháp 2] Dùng threshold riêng cho video upload (0.4 thay vì 0.8)
           if (label != null && conf != null && conf > _videoConfidenceThreshold) {
             rawPredictions.add(label);
           }
@@ -156,7 +198,7 @@ class VideoUploadNotifier extends Notifier<VideoUploadState> {
 
       debugPrint("📊 Tổng predictions thô: ${rawPredictions.length}");
 
-      // 4. Lọc nhiễu: loại bỏ từ lặp liên tiếp + từ bắt đầu bằng "Không rõ"
+      // 5. Lọc nhiễu: loại bỏ từ lặp liên tiếp + từ bắt đầu bằng "Không rõ"
       final List<String> finalGlossList = [];
       String? lastWord;
       for (final word in rawPredictions) {
@@ -177,7 +219,7 @@ class VideoUploadNotifier extends Notifier<VideoUploadState> {
         return;
       }
 
-      // 5. Dịch chuỗi Gloss thành câu tiếng Việt
+      // 6. Dịch chuỗi Gloss thành câu tiếng Việt
       try {
         debugPrint("🤖 Đang nhờ dịch chuỗi: $finalGlossList ...");
 
