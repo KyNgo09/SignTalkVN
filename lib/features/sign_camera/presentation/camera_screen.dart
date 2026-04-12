@@ -11,6 +11,7 @@ import '../providers/inference_provider.dart';
 import '../providers/video_upload_provider.dart';
 import '../../settings/providers/settings_provider.dart';
 import '../../settings/presentation/settings_screen.dart';
+import '../providers/network_provider.dart';
 import '../widgets/landmark_painter.dart';
 
 class CameraScreen extends ConsumerWidget {
@@ -103,6 +104,8 @@ class _TopBar extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final active = inferenceState.status != InferenceStatus.loadFailed;
     final mode = ref.watch(cameraModeProvider);
+    final isOnline = ref.watch(networkStatusProvider); // <- Thêm trạng thái mạng
+
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 18),
       child: Row(
@@ -115,6 +118,12 @@ class _TopBar extends ConsumerWidget {
           _Badge(
             color: mode == CameraMode.dictionary ? Colors.amber : Colors.greenAccent,
             label: mode == CameraMode.dictionary ? 'TỪ ĐIỂN' : 'GIAO TIẾP',
+          ),
+          const SizedBox(width: 8),
+          // Thêm Badge hiển thị trạng thái mạng
+          _Badge(
+            color: isOnline ? Colors.green : Colors.red,
+            label: isOnline ? 'ONLINE' : 'OFFLINE',
           ),
         ],
       ),
