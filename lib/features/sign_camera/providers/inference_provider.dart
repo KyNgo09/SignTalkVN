@@ -121,7 +121,7 @@ class InferenceNotifier extends Notifier<InferenceState> {
   int _nullPatienceCount = 0;
   int _convNullCount = 0; 
   static const int _maxNullAllowed = 2; 
-  static const int _maxConvNullAllowed = 75; // Chờ 2.5 giây để ngắt câu (thay vì 1s)
+  static const int _maxConvNullAllowed = 120; // Chờ 2.0 giây không thấy tay (hoặc tay thả lỏng hông) để chốt câu
   static const int _minFramesForValidGesture = 2;
 
   @override
@@ -239,7 +239,7 @@ class InferenceNotifier extends Notifier<InferenceState> {
         bytes = _convertYUV420ToNV21(image);
       }
 
-      final resultData = await _poseService.extractFeatures(
+      var currentResultData = await _poseService.extractFeatures(
         bytes,
         image.width,
         image.height,
@@ -247,10 +247,34 @@ class InferenceNotifier extends Notifier<InferenceState> {
         isFrontCamera,
       );
 
+      // --- KIỂM TRA TAY HẠ DƯỚI HÔNG (RESTING POSE) TRỰC TIẾP TRÊN DART ---
+      if (currentResultData != null) {
+        final List<double> rawLandmarks = (currentResultData['landmarks'] as List).cast<double>();
+        if (rawLandmarks.length >= 12) {
+          // Các index theo thứ tự map từ Android: 
+          // 0,1: Vai trái (X,Y) | 2,3: Vai phải (X,Y)
+          // 8,9: Cổ tay trái | 10,11: Cổ tay phải
+          final leftShoulderY = rawLandmarks[1];
+          final rightShoulderY = rawLandmarks[3];
+          final leftWristY = rawLandmarks[9];
+          final rightWristY = rawLandmarks[11];
+
+          // Khoảng cách 0.22 chiều cao màn hình từ Vai là đủ để tay rời khỏi lồng ngực (vùng múa).
+          // Hoặc cổ tay nằm hẳn ở 15% cạnh dưới cùng camera (0.85).
+          final bool isWristsLowRelative = leftWristY >= leftShoulderY + 0.22 && rightWristY >= rightShoulderY + 0.22;
+          final bool isWristsAtBottom = leftWristY >= 0.85 && rightWristY >= 0.85;
+
+          if (isWristsLowRelative || isWristsAtBottom) {
+             debugPrint("🛑 [REST KÍCH HOẠT] Wrists: $leftWristY|$rightWristY | Shoulders: $leftShoulderY|$rightShoulderY");
+             currentResultData = null; // Cố tình biến mất để kích hoạt ngắt câu
+          }
+        }
+      }
+
       final mode = ref.read(cameraModeProvider);
 
       if (mode == CameraMode.conversation) {
-        if (resultData == null) {
+        if (currentResultData == null) {
           _convNullCount++;
           if (_convNullCount > _maxConvNullAllowed) {
             if (state.isRecording) {
@@ -269,8 +293,8 @@ class InferenceNotifier extends Notifier<InferenceState> {
           }
         } else {
           _convNullCount = 0;
-          final List<double> features = (resultData['features'] as List).cast<double>();
-          final List<double> rawLandmarks = (resultData['landmarks'] as List).cast<double>();
+          final List<double> features = (currentResultData['features'] as List).cast<double>();
+          final List<double> rawLandmarks = (currentResultData['landmarks'] as List).cast<double>();
           
           if (!state.isRecording && state.status != InferenceStatus.processingConversation) {
             _startAutoRecording();
@@ -288,7 +312,7 @@ class InferenceNotifier extends Notifier<InferenceState> {
       }
 
       // KỊCH BẢN 1: KHÔNG THẤY TAY (Dictionary Mode)
-      if (resultData == null) {
+      if (currentResultData == null) {
         _nullPatienceCount++;
         if (_nullPatienceCount > _maxNullAllowed) {
           if (_frameBuffer.length >= _minFramesForValidGesture) {
@@ -326,8 +350,8 @@ class InferenceNotifier extends Notifier<InferenceState> {
       // KỊCH BẢN 2: ĐANG THẤY TAY (Dictionary Mode)
       else {
         _nullPatienceCount = 0;
-        final List<double> features = (resultData['features'] as List).cast<double>();
-        final List<double> rawLandmarks = (resultData['landmarks'] as List).cast<double>();
+        final List<double> features = (currentResultData['features'] as List).cast<double>();
+        final List<double> rawLandmarks = (currentResultData['landmarks'] as List).cast<double>();
 
         _frameBuffer.add(features);
         if (_frameBuffer.length > AppConstants.framesPerSequence) {
