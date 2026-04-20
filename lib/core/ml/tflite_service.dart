@@ -90,6 +90,8 @@ class TFLiteService {
       );
 
       // 3. CHẠY SUY LUẬN
+      // Cấp phát lại tensor & reset state của BiLSTM (tránh tàn dư state từ phép tính sliding window trước đó)
+      _interpreter!.allocateTensors();
       _interpreter!.run(inputTensor, outputTensor);
 
       // 4. TRÍCH XUẤT KẾT QUẢ

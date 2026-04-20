@@ -121,7 +121,7 @@ class InferenceNotifier extends Notifier<InferenceState> {
   int _nullPatienceCount = 0;
   int _convNullCount = 0; 
   static const int _maxNullAllowed = 2; 
-  static const int _maxConvNullAllowed = 120; // Chờ 2.0 giây không thấy tay (hoặc tay thả lỏng hông) để chốt câu
+  static const int _maxConvNullAllowed = 75; // Nới lên ~2.5 giây để tránh bị ngắt nửa chừng khi đang nối câu
   static const int _minFramesForValidGesture = 2;
 
   @override
@@ -167,8 +167,12 @@ class InferenceNotifier extends Notifier<InferenceState> {
   Future<void> _processConversationBuffer() async {
     state = state.copyWith(isRecording: false, status: InferenceStatus.processingConversation);
     
+    // Lấy dữ liệu và dọn dẹp bộ đệm ngay lập tức để camera có thể xử lý việc khác
+    final List<List<double>> bufferToProcess = List.of(_conversationBuffer);
+    _conversationBuffer.clear();
+
     // Nếu quá ngắn (dưới 10 frames túc vài mili-giây) thì bỏ qua
-    if (_conversationBuffer.length < 10) {
+    if (bufferToProcess.length < 10) {
       state = state.copyWith(status: InferenceStatus.ready, conversationResult: "Dữ liệu quá ngắn.");
       return;
     }
@@ -177,32 +181,56 @@ class InferenceNotifier extends Notifier<InferenceState> {
     final int stride = 5;
     
     // Padding data nếu user múa tự nhiên bị thiếu frame (< 40 frames)
-    if (_conversationBuffer.length < windowSize) {
-      final last = _conversationBuffer.last;
-      while (_conversationBuffer.length < windowSize) {
-        _conversationBuffer.add(last);
+    if (bufferToProcess.length < windowSize) {
+      final last = bufferToProcess.last;
+      while (bufferToProcess.length < windowSize) {
+        bufferToProcess.add(last);
       }
     }
 
     final List<String> rawPredictions = [];
 
-    for (int i = 0; i <= _conversationBuffer.length - windowSize; i += stride) {
-      final window = _conversationBuffer.sublist(i, i + windowSize);
+    // Chạy sliding window
+    for (int i = 0; i <= bufferToProcess.length - windowSize; i += stride) {
+      final window = bufferToProcess.sublist(i, i + windowSize);
       final infer = _tfliteService.predict(window);
       final labelStr = infer['label'] as String?;
       final conf = infer['confidence'] as double?;
-      if (labelStr != null && conf != null && conf >= 0.7) {
+      
+      // Hạ confidence xuống 0.5 để nhạy hơn trong Conversation Mode do tốc độ và nhiễu
+      if (labelStr != null && conf != null && conf >= 0.5) {
         rawPredictions.add(labelStr);
+      } else {
+        rawPredictions.add("UNKNOWN");
+      }
+
+      // Giữ cho sợi UI không bị nghẽn
+      if (i % 10 == 0) {
+        await Future.delayed(Duration.zero);
       }
     }
 
+    debugPrint("🧠 RAW PREDICTIONS: $rawPredictions");
+
+    // Thuật toán: Lọc từ thông minh
     final List<String> finalGlossList = [];
-    String? lastWord;
+    String? lastAddedWord;
+    int unknownStreak = 0;
+
     for (final word in rawPredictions) {
-      if (word.isEmpty || word.startsWith('Không rõ')) continue;
-      if (word != lastWord) {
+      if (word == 'UNKNOWN' || word.startsWith('Không rõ')) {
+        unknownStreak++;
+        // Nếu ngắt một khoảng không rõ (stride=5 -> 10 frames -> ~0.3s)
+        if (unknownStreak >= 2) {
+          lastAddedWord = null;
+        }
+        continue;
+      }
+      
+      unknownStreak = 0;
+      if (word != lastAddedWord) {
         finalGlossList.add(word);
-        lastWord = word;
+        lastAddedWord = word;
       }
     }
 
@@ -247,6 +275,8 @@ class InferenceNotifier extends Notifier<InferenceState> {
         isFrontCamera,
       );
 
+      bool isResting = false;
+
       // --- KIỂM TRA TAY HẠ DƯỚI HÔNG (RESTING POSE) TRỰC TIẾP TRÊN DART ---
       if (currentResultData != null) {
         final List<double> rawLandmarks = (currentResultData['landmarks'] as List).cast<double>();
@@ -259,14 +289,15 @@ class InferenceNotifier extends Notifier<InferenceState> {
           final leftWristY = rawLandmarks[9];
           final rightWristY = rawLandmarks[11];
 
-          // Khoảng cách 0.22 chiều cao màn hình từ Vai là đủ để tay rời khỏi lồng ngực (vùng múa).
+          // Khoảng cách 0.40 chiều cao màn hình từ Vai túc là tay hạ tới vùng ngang hông (Waist).
           // Hoặc cổ tay nằm hẳn ở 15% cạnh dưới cùng camera (0.85).
-          final bool isWristsLowRelative = leftWristY >= leftShoulderY + 0.22 && rightWristY >= rightShoulderY + 0.22;
+          final bool isWristsAtWaist = leftWristY >= leftShoulderY + 0.40 && rightWristY >= rightShoulderY + 0.40;
           final bool isWristsAtBottom = leftWristY >= 0.85 && rightWristY >= 0.85;
 
-          if (isWristsLowRelative || isWristsAtBottom) {
-             debugPrint("🛑 [REST KÍCH HOẠT] Wrists: $leftWristY|$rightWristY | Shoulders: $leftShoulderY|$rightShoulderY");
-             currentResultData = null; // Cố tình biến mất để kích hoạt ngắt câu
+          if (isWristsAtWaist || isWristsAtBottom) {
+             // Không set null tại đây để giữ lại tọa độ tay khi nghỉ ngơi, 
+             // giúp LSTM có khoảng đệm trung tính (tạo vách ngăn giữa các từ).
+             isResting = true;
           }
         }
       }
@@ -274,7 +305,7 @@ class InferenceNotifier extends Notifier<InferenceState> {
       final mode = ref.read(cameraModeProvider);
 
       if (mode == CameraMode.conversation) {
-        if (currentResultData == null) {
+        if (currentResultData == null || isResting) {
           _convNullCount++;
           if (_convNullCount > _maxConvNullAllowed) {
             if (state.isRecording) {
@@ -285,7 +316,14 @@ class InferenceNotifier extends Notifier<InferenceState> {
             }
           } else {
             if (state.isRecording) {
-              if (_conversationBuffer.isNotEmpty) {
+              if (currentResultData != null) {
+                 // Đưa dữ liệu khung hình tay buông lỏng vào buffer.
+                 // Lượng frame này giúp giãn cách thời gian giữa 2 từ giống như nguyên lý CTC,
+                 // khiến BiLSTM không bị dồn 3 từ tốc độ cao vào chung 1 ô sliding window.
+                 final List<double> features = (currentResultData['features'] as List).cast<double>();
+                 _conversationBuffer.add(features);
+              } else if (_conversationBuffer.isNotEmpty) {
+                 // Chỉ nếu thật sự null (mất tay do khuất camera), mới lặp lại frame cuối.
                  _conversationBuffer.add(_conversationBuffer.last);
               }
               state = state.copyWith(landmarks: const []);
@@ -311,8 +349,8 @@ class InferenceNotifier extends Notifier<InferenceState> {
         return;
       }
 
-      // KỊCH BẢN 1: KHÔNG THẤY TAY (Dictionary Mode)
-      if (currentResultData == null) {
+      // KỊCH BẢN 1: KHÔNG THẤY TAY Hoặc TAY ĐÃ HẠ XUỐNG BỤNG (Dictionary Mode)
+      if (currentResultData == null || isResting) {
         _nullPatienceCount++;
         if (_nullPatienceCount > _maxNullAllowed) {
           if (_frameBuffer.length >= _minFramesForValidGesture) {
